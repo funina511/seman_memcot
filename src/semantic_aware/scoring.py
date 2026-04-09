@@ -114,13 +114,25 @@ def build_scoring_windows(prefix_ids, assistant_ids, assistant_window_size):
 
 def tokenize_assistant_in_context(tokenizer, prefix_text, full_text):
     """Tokenize full text and extract assistant token metadata in context."""
-    encoded = tokenizer(
-        full_text,
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-    )
+    try:
+        encoded = tokenizer(
+            full_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Tokenizer must support offset mapping for scoring. "
+            "Use a fast tokenizer or one that returns offset_mapping."
+        ) from exc
+
     full_input_ids = encoded["input_ids"]
-    full_offsets = encoded["offset_mapping"]
+    full_offsets = encoded.get("offset_mapping")
+    if full_offsets is None:
+        raise ValueError(
+            "Tokenizer must support offset mapping for scoring. "
+            "Use a fast tokenizer or one that returns offset_mapping."
+        )
     assistant_start = len(prefix_text)
 
     assistant_token_ids = []
@@ -246,30 +258,35 @@ def compute_token_confidences_windowed(
 
 
 def score_assistant_tokens(
-    model,
-    tokenizer,
+    model=None,
+    tokenizer=None,
+    *,
+    backend=None,
     system_prompt,
     question,
     assistant_text,
     assistant_window_size=4096,
 ):
-    """Return assistant token ids, offsets, and confidences."""
-    prefix_ids, assistant_token_ids, assistant_offsets = tokenize_prompt_and_assistant(
-        tokenizer,
+    """Return assistant token ids, offsets, and confidences.
+
+    ``backend`` is the preferred entrypoint. ``model`` and ``tokenizer`` are still
+    accepted so existing HF callers can transition without changing call sites all at once.
+    """
+    if assistant_window_size <= 0:
+        raise ValueError("assistant_window_size must be positive.")
+
+    if backend is None:
+        if model is None or tokenizer is None:
+            raise TypeError(
+                "score_assistant_tokens requires either a backend or both model and tokenizer."
+            )
+        from semantic_aware.scoring_backends import HFScoringBackend
+
+        backend = HFScoringBackend(model=model, tokenizer=tokenizer)
+
+    return backend.score_assistant_tokens(
         system_prompt=system_prompt,
         question=question,
         assistant_text=assistant_text,
-    )
-    confidences = compute_token_confidences_windowed(
-        model,
-        prefix_ids=prefix_ids,
-        assistant_ids=assistant_token_ids,
         assistant_window_size=assistant_window_size,
     )
-    if len(confidences) != len(assistant_token_ids):
-        # Mismatched lengths usually mean a scoring-window bug, so fail loudly.
-        raise ValueError(
-            "Assistant token and confidence lengths do not align: "
-            f"{len(assistant_token_ids)} tokens vs {len(confidences)} confidences."
-        )
-    return assistant_token_ids, assistant_offsets, confidences

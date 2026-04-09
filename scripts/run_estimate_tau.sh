@@ -7,11 +7,13 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INPUT="${INPUT:-/path/to/bs17k.jsonl}"
 RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+BACKEND="${BACKEND:-hf}"
 SAMPLE_SIZE="${SAMPLE_SIZE:-1500}"
 SEED="${SEED:-42}"
 DTYPE="${DTYPE:-bfloat16}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 GPU_ID="${GPU_ID:-0}"
+GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 TAU_QUANTILES="${TAU_QUANTILES:-0.005,0.01,0.015,0.02}"
 MAX_LENGTH="${MAX_LENGTH:-8192}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -39,21 +41,39 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 "${ROOT_DIR}/tools/prepare_sample.py" \
   --seed "${SEED}" \
   "${LIMIT_ROWS_ARGS[@]}"
 
-ESTIMATE_ARGS=(
-  --input "${INPUT}"
-  --sampled_indices "${RUN_DIR}/sample_tau/sampled_indices.json"
-  --model "${MODEL}"
-  --output "${RUN_DIR}/sample_tau/tau_candidates.json"
-  --tau_quantiles "${TAU_QUANTILES}"
-  --dtype "${DTYPE}"
-  --trust_remote_code "${TRUST_REMOTE_CODE}"
-  --max_length "${MAX_LENGTH}"
-  --batch_size "${BATCH_SIZE}"
-  # Keep the scoring pass on a bounded assistant-side window even for long rows.
-  --assistant_window_size "${ASSISTANT_WINDOW_SIZE}"
-  "${LIMIT_ROWS_ARGS[@]}"
-  # `window` keeps overlong rows in tau estimation; `skip` drops them after counting.
-  --long_sample_policy "${LONG_SAMPLE_POLICY}"
-)
+IFS=',' read -r -a GPU_ARRAY <<< "${GPU_IDS}"
+WORLD_SIZE="${#GPU_ARRAY[@]}"
+PIDS=()
 
-CUDA_VISIBLE_DEVICES="${GPU_ID}" python3 "${ROOT_DIR}/tools/estimate_tau.py" "${ESTIMATE_ARGS[@]}"
+# Tau estimation fans out one worker per visible GPU in GPU_IDS.
+for rank in "${!GPU_ARRAY[@]}"; do
+  CUDA_VISIBLE_DEVICES="${GPU_ARRAY[$rank]}" python3 "${ROOT_DIR}/tools/estimate_tau.py" \
+    --input "${INPUT}" \
+    --sampled_indices "${RUN_DIR}/sample_tau/sampled_indices.json" \
+    --model "${MODEL}" \
+    --partial_output "${RUN_DIR}/sample_tau/tau_candidates.rank${rank}.json" \
+    --backend "${BACKEND}" \
+    --rank "${rank}" \
+    --world_size "${WORLD_SIZE}" \
+    --tau_quantiles "${TAU_QUANTILES}" \
+    --dtype "${DTYPE}" \
+    --trust_remote_code "${TRUST_REMOTE_CODE}" \
+    --max_length "${MAX_LENGTH}" \
+    --batch_size "${BATCH_SIZE}" \
+    --assistant_window_size "${ASSISTANT_WINDOW_SIZE}" \
+    "${LIMIT_ROWS_ARGS[@]}" \
+    --long_sample_policy "${LONG_SAMPLE_POLICY}" &
+  PIDS+=("$!")
+done
+
+for rank in "${!PIDS[@]}"; do
+  if ! wait "${PIDS[$rank]}"; then
+    echo "Tau worker ${rank} failed; aborting before merge." >&2
+    exit 1
+  fi
+done
+
+python3 "${ROOT_DIR}/tools/merge_tau_candidates.py" \
+  --inputs "${RUN_DIR}"/sample_tau/tau_candidates.rank*.json \
+  --output "${RUN_DIR}/sample_tau/tau_candidates.json" \
+  --tau_quantiles "${TAU_QUANTILES}"

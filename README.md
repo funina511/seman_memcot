@@ -46,6 +46,7 @@ Set your run-specific values, then either execute the two main phases separately
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
@@ -60,6 +61,9 @@ Or run the whole sequence:
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export WORLD_SIZE=4
+export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export TAU_KEY=q_0.0100
 
@@ -81,12 +85,15 @@ Minimal example:
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-export GPU_ID=0
+export BACKEND=hf
+export GPU_IDS=0,1
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
 bash semantic_aware/scripts/run_estimate_tau.sh
 ```
+
+`run_estimate_tau.sh` now launches one worker per visible GPU in `GPU_IDS`, merges the per-rank partial JSON files, and writes `${RUN_DIR}/sample_tau/tau_candidates.json`. For a single-GPU run, leave `GPU_IDS` unset or set `GPU_ID=0`.
 
 If you want to tune the estimation pass further:
 
@@ -98,10 +105,13 @@ export MAX_LENGTH=8192
 export BATCH_SIZE=1
 export DTYPE=bfloat16
 export TRUST_REMOTE_CODE=1
+export BACKEND=sglang
 export LONG_SAMPLE_POLICY=window
 
 bash semantic_aware/scripts/run_estimate_tau.sh
 ```
+
+Use `BACKEND=hf` for the default local Hugging Face scoring path. Use `BACKEND=sglang` only when the host has the `sglang` package and the matching scorer/runtime available; the wrappers simply thread the choice through to the Python tools.
 
 `ASSISTANT_WINDOW_SIZE=4096` keeps the scoring pass on a bounded assistant-side sliding window while preserving the full system/question prefix. `LIMIT_ROWS=2000` is a practical smoke-test limit when you want a shorter run without changing the input file. `LONG_SAMPLE_POLICY=window` keeps overlong rows in the output and tau estimate after counting them; `LONG_SAMPLE_POLICY=skip` records them in the run metadata but drops them from the written tau or shard output.
 
@@ -121,6 +131,7 @@ Typical 4-GPU run:
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
 export TAU_VALUE=0.557
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
@@ -133,6 +144,7 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 Each worker writes:
 
 - `${RUN_DIR}/export/shard_<rank>.jsonl`
+- `${RUN_DIR}/export/shard_<rank>.jsonl.meta.json`
 - `${RUN_DIR}/progress/shard_<rank>.json`
 - `${RUN_DIR}/logs/shard_<rank>.log`
 
@@ -159,6 +171,15 @@ python3 semantic_aware/tools/merge_jsonl.py \
   --output "${RUN_DIR}/merged/train.jsonl"
 ```
 
+## Runtime Metadata
+
+The Python tools write runtime metadata sidecars as `*.meta.json` files next to their main outputs. The most useful ones during operator checks are:
+
+- `${RUN_DIR}/sample_tau/tau_candidates.json.meta.json`
+- `${RUN_DIR}/export/shard_<rank>.jsonl.meta.json`
+
+These sidecars record fields such as backend, model, windowing controls, row limits, and summary counters so you can confirm a smoke run and a full run used the expected settings.
+
 ## Common Parameters
 
 These environment variables are the main knobs exposed by the shell wrappers:
@@ -166,10 +187,11 @@ These environment variables are the main knobs exposed by the shell wrappers:
 - `INPUT`: source JSONL dataset path.
 - `RUN_DIR`: output root for sampled indices, tau candidates, shards, logs, progress, and merged JSONL.
 - `MODEL`: model name or local checkpoint path passed to the Python tools.
-- `GPU_ID`: single GPU used for tau estimation.
+- `BACKEND`: scoring backend passed end-to-end to tau estimation and shard conversion. Common values are `hf` and `sglang`.
+- `GPU_ID`: fallback single GPU used for tau estimation when `GPU_IDS` is unset.
+- `GPU_IDS`: comma-separated GPU list aligned with rank order. Tau estimation now runs one worker per visible GPU in this list.
 - `TAU_VALUE`: selected tau threshold used during shard conversion.
 - `WORLD_SIZE`: number of shard workers to launch.
-- `GPU_IDS`: comma-separated GPU list aligned with rank order.
 - `DTYPE`: torch dtype string, default `bfloat16`.
 - `TRUST_REMOTE_CODE`: set `0` to disable remote-code trust.
 - `MAX_LENGTH`: threshold recorded for overlong statistics.
@@ -185,7 +207,7 @@ These environment variables are the main knobs exposed by the shell wrappers:
 
 Each conversion rank persists a JSON progress file at `${RUN_DIR}/progress/shard_<rank>.json`. The converter reads `last_source_idx`, `num_written`, `num_skipped`, `num_overlong`, and `finished` from that file before processing more rows. The same wrapper env vars, including `LIMIT_ROWS`, `ASSISTANT_WINDOW_SIZE`, and `LONG_SAMPLE_POLICY`, are passed through on resume runs.
 
-`run_convert_4gpu.sh` also writes `${RUN_DIR}/convert_runtime.env` as a small resume guard. If you rerun with the same `RUN_DIR` but change `TAU_VALUE`, `WORLD_SIZE`, `GPU_IDS`, `DTYPE`, `TRUST_REMOTE_CODE`, `BATCH_SIZE`, `ASSISTANT_WINDOW_SIZE`, `LIMIT_ROWS`, `LONG_SAMPLE_POLICY`, or other key conversion knobs, the wrapper stops early instead of mixing incompatible shard outputs into one merged dataset.
+`run_convert_4gpu.sh` also writes `${RUN_DIR}/convert_runtime.env` as a small resume guard. If you rerun with the same `RUN_DIR` but change `TAU_VALUE`, `BACKEND`, `WORLD_SIZE`, `GPU_IDS`, `DTYPE`, `TRUST_REMOTE_CODE`, `BATCH_SIZE`, `ASSISTANT_WINDOW_SIZE`, `LIMIT_ROWS`, `LONG_SAMPLE_POLICY`, or other key conversion knobs, the wrapper stops early instead of mixing incompatible shard outputs into one merged dataset.
 
 Operationally, that means:
 
@@ -193,3 +215,29 @@ Operationally, that means:
 - Existing shard JSONL files are appended to, not replaced, so resume runs should keep the same `RUN_DIR` and shard assignment.
 - A `finished: true` progress file means that rank has already completed its assigned modulo shard, and `convert_shard.py` will exit early for that shard instead of reloading the model.
 - If you need a clean rerun, remove or archive the old `RUN_DIR` first so progress, logs, and shard outputs do not mix with the new run.
+
+## Smoke Test
+
+Practical smoke-test command:
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k_smoke
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export GPU_IDS=0,1
+export WORLD_SIZE=2
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export TAU_KEY=q_0.0100
+
+bash semantic_aware/scripts/run_full_pipeline.sh
+```
+
+Expected key outputs:
+
+- `${RUN_DIR}/sample_tau/tau_candidates.json`
+- `${RUN_DIR}/sample_tau/tau_candidates.json.meta.json`
+- `${RUN_DIR}/progress/shard_0.json`
+- `${RUN_DIR}/logs/shard_0.log`
+- `${RUN_DIR}/merged/train.jsonl`

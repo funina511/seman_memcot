@@ -98,11 +98,21 @@ def split_text_by_token_boundaries(text, offsets, boundaries, min_step_chars):
     elif tail.strip():
         raw_segments.append(tail)
 
+    def should_merge_short_alpha_fragment(piece, *, has_neighbor):
+        stripped = piece.strip()
+        return has_neighbor and stripped.isalpha() and len(stripped) < 3
+
     segments = []
     pending_prefix = ""
     for piece in raw_segments:
         piece = pending_prefix + piece
         pending_prefix = ""
+        if should_merge_short_alpha_fragment(piece, has_neighbor=bool(segments) or len(raw_segments) > 1):
+            if segments:
+                segments[-1] += piece
+            else:
+                pending_prefix = piece
+            continue
         if is_valid_segment_text(piece) or segments:
             if is_valid_segment_text(piece):
                 segments.append(piece)

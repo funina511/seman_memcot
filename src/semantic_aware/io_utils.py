@@ -37,6 +37,17 @@ def write_json(path, obj):
         json.dump(obj, handle, ensure_ascii=False, indent=2)
 
 
+def metadata_path_for(path):
+    """Return the adjacent runtime metadata JSON path for an output artifact."""
+    output_path = Path(path)
+    return output_path.with_name(f"{output_path.name}.meta.json")
+
+
+def write_runtime_metadata(path, metadata):
+    """Persist lightweight runtime metadata next to an output artifact."""
+    write_json(metadata_path_for(path), metadata)
+
+
 def read_json(path):
     """Read JSON from disk."""
     with Path(path).open("r", encoding="utf-8") as handle:

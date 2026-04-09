@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INPUT="${INPUT:-/path/to/bs17k.jsonl}"
 RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+BACKEND="${BACKEND:-hf}"
 TAU_VALUE="${TAU_VALUE:-}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
@@ -36,6 +37,7 @@ CONFIG_PATH="${RUN_DIR}/convert_runtime.env"
 CONFIG_KEYS=(
   INPUT
   MODEL
+  BACKEND
   DTYPE
   TRUST_REMOTE_CODE
   BATCH_SIZE
@@ -106,6 +108,7 @@ for ((RANK = 0; RANK < WORLD_SIZE; RANK++)); do
     --input "${INPUT}"
     --model "${MODEL}"
     --tau "${TAU_VALUE}"
+    --backend "${BACKEND}"
     --rank "${RANK}"
     --world_size "${WORLD_SIZE}"
     --output "${RUN_DIR}/export/shard_${RANK}.jsonl"

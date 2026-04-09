@@ -3,8 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+INPUT="${INPUT:-/path/to/bs17k.jsonl}"
 RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
+MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+BACKEND="${BACKEND:-hf}"
 TAU_KEY="${TAU_KEY:-q_0.0100}"
+TAU_VALUE="${TAU_VALUE:-}"
+WORLD_SIZE="${WORLD_SIZE:-4}"
+GPU_IDS="${GPU_IDS:-0,1,2,3}"
 ASSISTANT_WINDOW_SIZE="${ASSISTANT_WINDOW_SIZE:-4096}"
 LIMIT_ROWS="${LIMIT_ROWS:-}"
 LONG_SAMPLE_POLICY="${LONG_SAMPLE_POLICY:-window}"
@@ -30,7 +36,7 @@ PY
 }
 
 # Full pipeline wrapper: keep the major runtime knobs visible at this top level.
-export RUN_DIR TAU_KEY ASSISTANT_WINDOW_SIZE LIMIT_ROWS LONG_SAMPLE_POLICY
+export INPUT RUN_DIR MODEL BACKEND TAU_KEY TAU_VALUE WORLD_SIZE GPU_IDS ASSISTANT_WINDOW_SIZE LIMIT_ROWS LONG_SAMPLE_POLICY
 bash "${SCRIPT_DIR}/run_estimate_tau.sh"
 if [[ -z "${TAU_VALUE:-}" ]]; then
   # Default to the 1% candidate unless the operator pins TAU_VALUE explicitly.

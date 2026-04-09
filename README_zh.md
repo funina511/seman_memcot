@@ -49,6 +49,9 @@ semantic_aware/
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_smoke
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export WORLD_SIZE=4
+export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 export TAU_KEY=q_0.0100
@@ -71,6 +74,8 @@ bash semantic_aware/scripts/run_full_pipeline.sh
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_smoke
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export GPU_IDS=0,1
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
@@ -80,6 +85,7 @@ bash semantic_aware/scripts/run_estimate_tau.sh
 看完 `${RUN_DIR}/sample_tau/tau_candidates.json` 之后，再选一个值继续：
 
 ```bash
+export BACKEND=hf
 export TAU_VALUE=0.557
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
@@ -88,6 +94,7 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 ```
 
 注意：`run_convert_4gpu.sh` 现在要求你显式设置 `TAU_VALUE`，不会再偷偷回退到旧默认值。
+另外，`run_estimate_tau.sh` 现在会按 `GPU_IDS` 里的可见卡列表，每张 GPU 启动一个 worker 来并行估计 tau；单卡时不设 `GPU_IDS` 或保留 `GPU_ID=0` 即可。
 
 ## 常用参数
 
@@ -96,21 +103,32 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 - `INPUT`：原始 JSONL 数据集路径
 - `RUN_DIR`：本次运行的输出目录
 - `MODEL`：用于 teacher forcing 打分的模型
+- `BACKEND`：后端类型，常用 `BACKEND=hf` 或 `BACKEND=sglang`
 - `ASSISTANT_WINDOW_SIZE`：assistant 侧滑窗大小，默认 `4096`
 - `LIMIT_ROWS`：只处理输入前 N 条，适合 smoke test
 - `TAU_KEY`：完整流程脚本用于自动选取 `tau` 的键，默认 `q_0.0100`
 - `TAU_VALUE`：手动转换时使用的具体阈值
 - `WORLD_SIZE`：转换阶段并行 shard 数
-- `GPU_IDS`：和 `WORLD_SIZE` 对齐的显卡列表，比如 `0,1,2,3`
+- `GPU_IDS`：和 `WORLD_SIZE` 对齐的显卡列表，比如 `0,1,2,3`；tau 估计阶段也会按这个列表一张卡起一个 worker
 - `LONG_SAMPLE_POLICY`：超长样本策略，`window` 或 `skip`
+
+`BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 只建议在机器上已经准备好 `sglang` 及对应 scorer/runtime 时使用；shell 包装脚本只是把这个参数原样传给 Python 工具。
 
 ## 推荐部署方式
 
 ### 1. 先做 2000 条 smoke test
 
 ```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k_smoke
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export WORLD_SIZE=2
+export GPU_IDS=0,1
 export LIMIT_ROWS=2000
 export ASSISTANT_WINDOW_SIZE=4096
+export TAU_KEY=q_0.0100
+
 bash semantic_aware/scripts/run_full_pipeline.sh
 ```
 
@@ -167,6 +185,7 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 ```
 
 脚本会先检查参数是否和上次一致；如果不一致，会直接报错，让你换新的 `RUN_DIR` 或恢复原参数。
+这里的保护项现在也包含 `BACKEND`，避免同一个输出目录里混入不同后端打分结果。
 
 ## 常见输出位置
 
@@ -174,13 +193,17 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 
 - `${RUN_DIR}/sample_tau/sampled_indices.json`
 - `${RUN_DIR}/sample_tau/tau_candidates.json`
+- `${RUN_DIR}/sample_tau/tau_candidates.json.meta.json`
 
 转换阶段的结果：
 
 - `${RUN_DIR}/export/shard_<rank>.jsonl`
+- `${RUN_DIR}/export/shard_<rank>.jsonl.meta.json`
 - `${RUN_DIR}/progress/shard_<rank>.json`
 - `${RUN_DIR}/logs/shard_<rank>.log`
 - `${RUN_DIR}/merged/train.jsonl`
+
+这些 `*.meta.json` sidecar 会记录 backend、model、窗口参数、limit_rows、计数统计等运行时元数据，方便确认 smoke test 和正式跑的配置一致。
 
 ## 出问题时先看哪里
 
@@ -193,6 +216,32 @@ tail -n 50 "${RUN_DIR}/logs/shard_0.log"
 head -n 3 "${RUN_DIR}/merged/train.jsonl"
 ```
 
+## Smoke Test 命令
+
+建议先用一个很小的子集做 smoke test：
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k_smoke
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=hf
+export GPU_IDS=0,1
+export WORLD_SIZE=2
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export TAU_KEY=q_0.0100
+
+bash semantic_aware/scripts/run_full_pipeline.sh
+```
+
+预期关键输出：
+
+- `${RUN_DIR}/sample_tau/tau_candidates.json`
+- `${RUN_DIR}/sample_tau/tau_candidates.json.meta.json`
+- `${RUN_DIR}/progress/shard_0.json`
+- `${RUN_DIR}/logs/shard_0.log`
+- `${RUN_DIR}/merged/train.jsonl`
+
 ## 当前实现状态
 
 这套 `semantic_aware` 流程目前已经覆盖：
@@ -204,10 +253,10 @@ head -n 3 "${RUN_DIR}/merged/train.jsonl"
 - shell 脚本全流程入口
 - 断点续跑和参数一致性保护
 
-还需要你在目标服务器上补做的一步是：
+还需要你在目标服务器上补做的一步是：在项目根目录执行一次完整 pytest；如果服务器上还没有 `pytest`，先安装它再跑。
 
 ```bash
 pytest tests -v
 ```
 
-因为当前这个环境里没有安装 `pytest`，所以我这边做的是 `compileall`、`--help`、shell 语法检查和几条针对性的 smoke check，而不是完整 pytest。
+如果你是在一个依赖不完整的精简环境里先做预检查，至少先跑 `compileall`、`--help`、shell 语法检查和几条针对性的 smoke check；但在正式跑服务器任务前，仍然建议补一次完整 `pytest`。
