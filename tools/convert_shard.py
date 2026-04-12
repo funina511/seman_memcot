@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from semantic_aware.boundary import pick_boundaries, split_text_by_token_boundaries
-from semantic_aware.exporter import build_output_record
+from semantic_aware.exporter import build_output_record_from_reference
 from semantic_aware.io_utils import (
     append_jsonl,
     iter_jsonl,
@@ -23,9 +23,8 @@ from semantic_aware.io_utils import (
     write_runtime_metadata,
 )
 from semantic_aware.protected_tokens import build_cuttable_mask, find_protected_spans
-from semantic_aware.role_extract import extract_roles
-from semantic_aware.scoring import load_model_and_tokenizer
-from semantic_aware.scoring_backends import get_scoring_backend
+from semantic_aware.scoring import tokenize_prompt_and_assistant
+from semantic_aware.scoring_backends import init_scoring_backend
 
 
 def parse_args():
@@ -43,6 +42,11 @@ def parse_args():
     parser.add_argument("--world_size", required=True, type=int, help="Total shard count")
     parser.add_argument("--output", required=True, help="Output JSONL path for this shard")
     parser.add_argument("--progress", required=True, help="Progress JSON path for this shard")
+    parser.add_argument(
+        "--reference_train_jsonl",
+        default=str(PROJECT_ROOT.parent / "RRcot" / "data" / "train" / "train.jsonl"),
+        help="Reference LightThinker train.jsonl; all fields except thoughts_list are inherited",
+    )
     parser.add_argument("--dtype", default="bfloat16", help="Torch dtype name")
     parser.add_argument("--trust_remote_code", default=1, type=int, help="Pass 0 to disable trust_remote_code")
     parser.add_argument("--max_length", default=8192, type=int, help="Length threshold used for overlong statistics")
@@ -72,22 +76,25 @@ def parse_args():
 
 def main():
     args = parse_args()
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.touch(exist_ok=True)
+    if not Path(args.reference_train_jsonl).exists():
+        raise ValueError(f"reference_train_jsonl not found: {args.reference_train_jsonl}")
+
     progress = load_progress(args.progress)
     if progress.get("finished"):
         # A finished shard should be a cheap no-op on resume.
         return
     last_source_idx = progress.get("last_source_idx", -1)
 
-    model, tokenizer = load_model_and_tokenizer(
-        args.model,
+    scoring_backend, tokenizer = init_scoring_backend(
+        backend_name=args.backend,
+        model_name=args.model,
         dtype=args.dtype,
         trust_remote_code=bool(args.trust_remote_code),
     )
-    scoring_backend = get_scoring_backend(
-        backend_name=args.backend,
-        model=model,
-        tokenizer=tokenizer,
-    )
+    reference_iter = iter_jsonl(args.reference_train_jsonl, limit_rows=args.limit_rows)
 
     written = progress.get("num_written", 0)
     skipped = progress.get("num_skipped", 0)
@@ -97,14 +104,31 @@ def main():
     token_count = 0
     score_seconds_total = 0.0
 
-    for source_idx, obj in enumerate(iter_jsonl(args.input, limit_rows=args.limit_rows)):
+    for source_idx, _ in enumerate(iter_jsonl(args.input, limit_rows=args.limit_rows)):
+        try:
+            reference_record = next(reference_iter)
+        except StopIteration as error:
+            raise ValueError(
+                "reference_train_jsonl has fewer rows than input; "
+                f"missing row for source_idx={source_idx}."
+            ) from error
+
         if source_idx % args.world_size != args.rank:
             continue
         if source_idx <= last_source_idx:
             continue
         rows_seen += 1
 
-        system_prompt, question, assistant = extract_roles(obj)
+        reference_source_idx = reference_record.get("source_idx")
+        if reference_source_idx is not None and reference_source_idx != source_idx:
+            raise ValueError(
+                "source_idx mismatch between input and reference_train_jsonl: "
+                f"source_idx={source_idx}, reference_source_idx={reference_source_idx}"
+            )
+
+        system_prompt = reference_record.get("system_prompt", "") or ""
+        question = reference_record.get("question", "") or ""
+        assistant = reference_record.get("gt_output", "") or ""
         if not question or not assistant:
             skipped += 1
             progress = {
@@ -118,6 +142,31 @@ def main():
             }
             save_progress(args.progress, progress)
             continue
+
+        if args.long_sample_policy == "skip":
+            # Skip overlong rows before model scoring to avoid avoidable OOM spikes.
+            try:
+                _, preview_assistant_ids, _ = tokenize_prompt_and_assistant(
+                    tokenizer,
+                    system_prompt=system_prompt,
+                    question=question,
+                    assistant_text=assistant,
+                )
+            except Exception:
+                preview_assistant_ids = None
+            if preview_assistant_ids is not None and len(preview_assistant_ids) > args.max_length:
+                overlong += 1
+                progress = {
+                    "rank": args.rank,
+                    "world_size": args.world_size,
+                    "last_source_idx": source_idx,
+                    "num_written": written,
+                    "num_skipped": skipped,
+                    "num_overlong": overlong,
+                    "finished": False,
+                }
+                save_progress(args.progress, progress)
+                continue
 
         started = time.perf_counter()
         token_ids, offsets, confidences = scoring_backend.score_assistant_tokens(
@@ -165,12 +214,10 @@ def main():
         )
         append_jsonl(
             args.output,
-            build_output_record(
-                source_idx=source_idx,
-                system_prompt=system_prompt,
-                question=question,
-                gt_output=assistant,
+            build_output_record_from_reference(
+                reference_record=reference_record,
                 thoughts_list=thoughts_list,
+                source_idx=source_idx,
             ),
         )
 

@@ -7,6 +7,7 @@ INPUT="${INPUT:-/path/to/bs17k.jsonl}"
 RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
+REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"
 TAU_KEY="${TAU_KEY:-q_0.0100}"
 TAU_VALUE="${TAU_VALUE:-}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
@@ -36,7 +37,7 @@ PY
 }
 
 # Full pipeline wrapper: keep the major runtime knobs visible at this top level.
-export INPUT RUN_DIR MODEL BACKEND TAU_KEY TAU_VALUE WORLD_SIZE GPU_IDS ASSISTANT_WINDOW_SIZE LIMIT_ROWS LONG_SAMPLE_POLICY
+export INPUT RUN_DIR MODEL BACKEND REFERENCE_TRAIN_JSONL TAU_KEY TAU_VALUE WORLD_SIZE GPU_IDS ASSISTANT_WINDOW_SIZE LIMIT_ROWS LONG_SAMPLE_POLICY
 bash "${SCRIPT_DIR}/run_estimate_tau.sh"
 if [[ -z "${TAU_VALUE:-}" ]]; then
   # Default to the 1% candidate unless the operator pins TAU_VALUE explicitly.

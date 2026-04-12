@@ -16,8 +16,8 @@ if str(SRC_ROOT) not in sys.path:
 from semantic_aware.io_utils import iter_jsonl, read_json, write_json, write_runtime_metadata
 from semantic_aware.protected_tokens import build_cuttable_mask, find_protected_spans
 from semantic_aware.role_extract import extract_roles
-from semantic_aware.scoring import load_model_and_tokenizer
-from semantic_aware.scoring_backends import get_scoring_backend
+from semantic_aware.scoring import tokenize_prompt_and_assistant
+from semantic_aware.scoring_backends import init_scoring_backend
 from semantic_aware.tau_estimation import compute_quantile, estimate_tau_from_records
 
 
@@ -130,15 +130,11 @@ def main():
         world_size=args.world_size,
     )
 
-    model, tokenizer = load_model_and_tokenizer(
-        args.model,
+    scoring_backend, tokenizer = init_scoring_backend(
+        backend_name=args.backend,
+        model_name=args.model,
         dtype=args.dtype,
         trust_remote_code=bool(args.trust_remote_code),
-    )
-    scoring_backend = get_scoring_backend(
-        backend_name=args.backend,
-        model=model,
-        tokenizer=tokenizer,
     )
 
     records = []
@@ -157,6 +153,21 @@ def main():
         system_prompt, question, assistant = extract_roles(obj)
         if not question or not assistant:
             continue
+
+        if args.long_sample_policy == "skip":
+            # Skip overlong rows before model scoring to avoid avoidable OOM spikes.
+            try:
+                _, preview_assistant_ids, _ = tokenize_prompt_and_assistant(
+                    tokenizer,
+                    system_prompt=system_prompt,
+                    question=question,
+                    assistant_text=assistant,
+                )
+            except Exception:
+                preview_assistant_ids = None
+            if preview_assistant_ids is not None and len(preview_assistant_ids) > args.max_length:
+                overlong += 1
+                continue
 
         started = time.perf_counter()
         token_ids, offsets, confidences = scoring_backend.score_assistant_tokens(

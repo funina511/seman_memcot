@@ -26,6 +26,17 @@ if [[ -n "${LIMIT_ROWS}" ]]; then
   LIMIT_ROWS_ARGS+=(--limit_rows "${LIMIT_ROWS}")
 fi
 
+if [[ "${BACKEND}" == "sglang" ]]; then
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import sglang
+PY
+  then
+    echo "ERROR: BACKEND=sglang but current python3 cannot import sglang." >&2
+    echo "Please activate your sglang environment before running run_estimate_tau.sh." >&2
+    exit 1
+  fi
+fi
+
 EFFECTIVE_SAMPLE_SIZE="${SAMPLE_SIZE}"
 if [[ -n "${LIMIT_ROWS}" ]] && (( EFFECTIVE_SAMPLE_SIZE > LIMIT_ROWS )); then
   # Keep smoke-test subsets usable without forcing the operator to tune SAMPLE_SIZE by hand.

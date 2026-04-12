@@ -1,21 +1,21 @@
-# semantic_aware
+# seman_memcot
 
-For a deployment-oriented Chinese guide, see [README_zh.md](/home/elysia/code/semantic_aware/README_zh.md).
+For a deployment-oriented Chinese guide, see [README_zh.md](README_zh.md).
 
 ## What This Does
 
-`semantic_aware/` packages the semantic-aware AdaptiveStep to LightThinker conversion workflow into one operator-facing workspace. The normal flow is:
+`seman_memcot/` packages the semantic-aware AdaptiveStep to LightThinker conversion workflow into one operator-facing workspace. The normal flow is:
 
 1. Sample rows and estimate candidate tau thresholds.
 2. Launch 4 shard-conversion workers across GPUs.
 3. Merge shard outputs into one sorted training JSONL.
 
-The bash entrypoints under `semantic_aware/scripts/` are the intended starting point for routine runs.
+The bash entrypoints under `seman_memcot/scripts/` are the intended starting point for routine runs.
 
 ## Directory Layout
 
 ```text
-semantic_aware/
+seman_memcot/
 ├── README.md
 ├── scripts/
 │   ├── run_estimate_tau.sh
@@ -50,9 +50,9 @@ export BACKEND=hf
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
-bash semantic_aware/scripts/run_estimate_tau.sh
+bash seman_memcot/scripts/run_estimate_tau.sh
 export TAU_VALUE=0.557  # Replace with the candidate you choose from tau_candidates.json
-bash semantic_aware/scripts/run_convert_4gpu.sh
+bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
 Or run the whole sequence:
@@ -67,7 +67,7 @@ export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export TAU_KEY=q_0.0100
 
-bash semantic_aware/scripts/run_full_pipeline.sh
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 If you do not set `TAU_VALUE` yourself, `run_full_pipeline.sh` reads `${RUN_DIR}/sample_tau/tau_candidates.json` and uses `TAU_KEY` to select a candidate automatically. The default `TAU_KEY=q_0.0100` matches the 1% candidate.
@@ -90,7 +90,7 @@ export GPU_IDS=0,1
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
-bash semantic_aware/scripts/run_estimate_tau.sh
+bash seman_memcot/scripts/run_estimate_tau.sh
 ```
 
 `run_estimate_tau.sh` now launches one worker per visible GPU in `GPU_IDS`, merges the per-rank partial JSON files, and writes `${RUN_DIR}/sample_tau/tau_candidates.json`. For a single-GPU run, leave `GPU_IDS` unset or set `GPU_ID=0`.
@@ -108,10 +108,10 @@ export TRUST_REMOTE_CODE=1
 export BACKEND=sglang
 export LONG_SAMPLE_POLICY=window
 
-bash semantic_aware/scripts/run_estimate_tau.sh
+bash seman_memcot/scripts/run_estimate_tau.sh
 ```
 
-Use `BACKEND=hf` for the default local Hugging Face scoring path. Use `BACKEND=sglang` only when the host has the `sglang` package and the matching scorer/runtime available; the wrappers simply thread the choice through to the Python tools.
+Use `BACKEND=hf` for the default local Hugging Face scoring path. Use `BACKEND=sglang` only when the current `python3` can import `sglang`; the shell wrappers now fail fast with an explicit environment hint if this check fails.
 
 `ASSISTANT_WINDOW_SIZE=4096` keeps the scoring pass on a bounded assistant-side sliding window while preserving the full system/question prefix. `LIMIT_ROWS=2000` is a practical smoke-test limit when you want a shorter run without changing the input file. `LONG_SAMPLE_POLICY=window` keeps overlong rows in the output and tau estimate after counting them; `LONG_SAMPLE_POLICY=skip` records them in the run metadata but drops them from the written tau or shard output.
 
@@ -138,7 +138,7 @@ export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
-bash semantic_aware/scripts/run_convert_4gpu.sh
+bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
 Each worker writes:
@@ -147,6 +147,8 @@ Each worker writes:
 - `${RUN_DIR}/export/shard_<rank>.jsonl.meta.json`
 - `${RUN_DIR}/progress/shard_<rank>.json`
 - `${RUN_DIR}/logs/shard_<rank>.log`
+
+Shard conversion inherits non-`thoughts_list` fields from `REFERENCE_TRAIN_JSONL` row-by-row, then overwrites only `thoughts_list` with the semantic split output.
 
 When all ranks finish successfully, the script automatically merges them into `${RUN_DIR}/merged/train.jsonl`.
 
@@ -166,7 +168,7 @@ tail -n 50 "${RUN_DIR}/logs/shard_0.log"
 If you need to rerun just the merge manually, use the tool directly:
 
 ```bash
-python3 semantic_aware/tools/merge_jsonl.py \
+python3 seman_memcot/tools/merge_jsonl.py \
   --inputs "${RUN_DIR}/export/shard_0.jsonl" "${RUN_DIR}/export/shard_1.jsonl" "${RUN_DIR}/export/shard_2.jsonl" "${RUN_DIR}/export/shard_3.jsonl" \
   --output "${RUN_DIR}/merged/train.jsonl"
 ```
@@ -187,6 +189,7 @@ These environment variables are the main knobs exposed by the shell wrappers:
 - `INPUT`: source JSONL dataset path.
 - `RUN_DIR`: output root for sampled indices, tau candidates, shards, logs, progress, and merged JSONL.
 - `MODEL`: model name or local checkpoint path passed to the Python tools.
+- `REFERENCE_TRAIN_JSONL`: reference LightThinker train JSONL used by conversion; all fields except `thoughts_list` are inherited from this file.
 - `BACKEND`: scoring backend passed end-to-end to tau estimation and shard conversion. Common values are `hf` and `sglang`.
 - `GPU_ID`: fallback single GPU used for tau estimation when `GPU_IDS` is unset.
 - `GPU_IDS`: comma-separated GPU list aligned with rank order. Tau estimation now runs one worker per visible GPU in this list.
@@ -211,7 +214,7 @@ Each conversion rank persists a JSON progress file at `${RUN_DIR}/progress/shard
 
 Operationally, that means:
 
-- Re-running `bash semantic_aware/scripts/run_convert_4gpu.sh` with the same `RUN_DIR` resumes each rank from the last recorded `source_idx` instead of rewriting completed work.
+- Re-running `bash seman_memcot/scripts/run_convert_4gpu.sh` with the same `RUN_DIR` resumes each rank from the last recorded `source_idx` instead of rewriting completed work.
 - Existing shard JSONL files are appended to, not replaced, so resume runs should keep the same `RUN_DIR` and shard assignment.
 - A `finished: true` progress file means that rank has already completed its assigned modulo shard, and `convert_shard.py` will exit early for that shard instead of reloading the model.
 - If you need a clean rerun, remove or archive the old `RUN_DIR` first so progress, logs, and shard outputs do not mix with the new run.
@@ -231,7 +234,7 @@ export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
 export TAU_KEY=q_0.0100
 
-bash semantic_aware/scripts/run_full_pipeline.sh
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 Expected key outputs:

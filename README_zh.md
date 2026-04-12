@@ -1,4 +1,4 @@
-# semantic_aware 中文部署说明
+# seman_memcot 中文部署说明
 
 这份文档面向“尽快跑起来”的场景，重点说明如何把 `Bespoke-Stratos-17k` 转成 `LightThinker` 需要的训练 JSONL，并支持：
 
@@ -8,12 +8,12 @@
 - 断点续跑
 - 自动读取估计出的 `tau`
 
-如果你想看英文版总说明，可以参考 [README.md](/home/elysia/code/semantic_aware/README.md)。
+如果你想看英文版总说明，可以参考 [README.md](README.md)。
 
 ## 目录结构
 
 ```text
-semantic_aware/
+seman_memcot/
 ├── README.md
 ├── README_zh.md
 ├── scripts/
@@ -26,9 +26,9 @@ semantic_aware/
 
 平时最常用的是这 3 个脚本：
 
-- `semantic_aware/scripts/run_estimate_tau.sh`
-- `semantic_aware/scripts/run_convert_4gpu.sh`
-- `semantic_aware/scripts/run_full_pipeline.sh`
+- `seman_memcot/scripts/run_estimate_tau.sh`
+- `seman_memcot/scripts/run_convert_4gpu.sh`
+- `seman_memcot/scripts/run_full_pipeline.sh`
 
 ## 你真正需要记住的流程
 
@@ -54,9 +54,9 @@ export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
-export TAU_KEY=q_0.0100
+export TAU_KEY=q_0.0200
 
-bash semantic_aware/scripts/run_full_pipeline.sh
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 这条命令会自动完成：
@@ -79,7 +79,7 @@ export GPU_IDS=0,1
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
-bash semantic_aware/scripts/run_estimate_tau.sh
+bash seman_memcot/scripts/run_estimate_tau.sh
 ```
 
 看完 `${RUN_DIR}/sample_tau/tau_candidates.json` 之后，再选一个值继续：
@@ -90,7 +90,7 @@ export TAU_VALUE=0.557
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 
-bash semantic_aware/scripts/run_convert_4gpu.sh
+bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
 注意：`run_convert_4gpu.sh` 现在要求你显式设置 `TAU_VALUE`，不会再偷偷回退到旧默认值。
@@ -103,6 +103,7 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 - `INPUT`：原始 JSONL 数据集路径
 - `RUN_DIR`：本次运行的输出目录
 - `MODEL`：用于 teacher forcing 打分的模型
+- `REFERENCE_TRAIN_JSONL`：参考训练集路径，转换输出会继承该文件对应行的全部字段，仅覆盖 `thoughts_list`
 - `BACKEND`：后端类型，常用 `BACKEND=hf` 或 `BACKEND=sglang`
 - `ASSISTANT_WINDOW_SIZE`：assistant 侧滑窗大小，默认 `4096`
 - `LIMIT_ROWS`：只处理输入前 N 条，适合 smoke test
@@ -112,24 +113,24 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 - `GPU_IDS`：和 `WORLD_SIZE` 对齐的显卡列表，比如 `0,1,2,3`；tau 估计阶段也会按这个列表一张卡起一个 worker
 - `LONG_SAMPLE_POLICY`：超长样本策略，`window` 或 `skip`
 
-`BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 只建议在机器上已经准备好 `sglang` 及对应 scorer/runtime 时使用；shell 包装脚本只是把这个参数原样传给 Python 工具。
+`BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 需要在当前 `python3` 环境可导入 `sglang`；shell 脚本会先做前置检查，不满足时会直接失败并提示切换到 sglang 环境。
 
 ## 推荐部署方式
 
 ### 1. 先做 2000 条 smoke test
 
 ```bash
-export INPUT=/data/bs17k.jsonl
+export INPUT=bs17k.jsonl
 export RUN_DIR=runs/bs17k_smoke
-export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
-export WORLD_SIZE=2
-export GPU_IDS=0,1
-export LIMIT_ROWS=2000
+export WORLD_SIZE=4
+export GPU_IDS=0,1,2,3
+export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
-export TAU_KEY=q_0.0100
-
-bash semantic_aware/scripts/run_full_pipeline.sh
+export TAU_KEY=q_0.0200
+export SGLANG_MEM_FRACTION_STATIC=0.65
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 这一步主要看：
@@ -144,7 +145,7 @@ bash semantic_aware/scripts/run_full_pipeline.sh
 
 ```bash
 unset LIMIT_ROWS
-bash semantic_aware/scripts/run_full_pipeline.sh
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 ## 关于 LIMIT_ROWS 的一个细节
@@ -181,7 +182,7 @@ export LIMIT_ROWS=2000
 如果你用同一个 `RUN_DIR` 重新执行：
 
 ```bash
-bash semantic_aware/scripts/run_convert_4gpu.sh
+bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
 脚本会先检查参数是否和上次一致；如果不一致，会直接报错，让你换新的 `RUN_DIR` 或恢复原参数。
@@ -203,6 +204,8 @@ bash semantic_aware/scripts/run_convert_4gpu.sh
 - `${RUN_DIR}/logs/shard_<rank>.log`
 - `${RUN_DIR}/merged/train.jsonl`
 
+转换输出记录采用“参考继承”模式：会从 `REFERENCE_TRAIN_JSONL` 对应位置继承除 `thoughts_list` 外的字段，再写入当前语义切分得到的 `thoughts_list`。
+
 这些 `*.meta.json` sidecar 会记录 backend、model、窗口参数、limit_rows、计数统计等运行时元数据，方便确认 smoke test 和正式跑的配置一致。
 
 ## 出问题时先看哪里
@@ -221,17 +224,17 @@ head -n 3 "${RUN_DIR}/merged/train.jsonl"
 建议先用一个很小的子集做 smoke test：
 
 ```bash
-export INPUT=/data/bs17k.jsonl
+export INPUT=bs17k.jsonl
 export RUN_DIR=runs/bs17k_smoke
-export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-export BACKEND=hf
-export GPU_IDS=0,1
-export WORLD_SIZE=2
-export LIMIT_ROWS=200
+export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=sglang
+export GPU_IDS=0,1,2,3
+export WORLD_SIZE=4
+export LIMIT_ROWS=500
 export ASSISTANT_WINDOW_SIZE=4096
-export TAU_KEY=q_0.0100
+export TAU_KEY=q_0.0200
 
-bash semantic_aware/scripts/run_full_pipeline.sh
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 预期关键输出：
@@ -244,7 +247,7 @@ bash semantic_aware/scripts/run_full_pipeline.sh
 
 ## 当前实现状态
 
-这套 `semantic_aware` 流程目前已经覆盖：
+这套 `seman_memcot` 流程目前已经覆盖：
 
 - assistant-side `4096` 滑窗打分
 - 低质量碎片段合并/过滤

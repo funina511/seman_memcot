@@ -8,6 +8,7 @@ INPUT="${INPUT:-/path/to/bs17k.jsonl}"
 RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
+REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"
 TAU_VALUE="${TAU_VALUE:-}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
@@ -31,6 +32,22 @@ if [[ -z "${TAU_VALUE}" ]]; then
   exit 1
 fi
 
+if [[ "${BACKEND}" == "sglang" ]]; then
+  if ! python3 - <<'PY' >/dev/null 2>&1
+import sglang
+PY
+  then
+    echo "ERROR: BACKEND=sglang but current python3 cannot import sglang." >&2
+    echo "Please activate your sglang environment before running run_convert_4gpu.sh." >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -f "${REFERENCE_TRAIN_JSONL}" ]]; then
+  echo "ERROR: reference train jsonl not found: ${REFERENCE_TRAIN_JSONL}" >&2
+  exit 1
+fi
+
 mkdir -p "${RUN_DIR}/export" "${RUN_DIR}/progress" "${RUN_DIR}/logs" "${RUN_DIR}/merged"
 
 CONFIG_PATH="${RUN_DIR}/convert_runtime.env"
@@ -38,6 +55,7 @@ CONFIG_KEYS=(
   INPUT
   MODEL
   BACKEND
+  REFERENCE_TRAIN_JSONL
   DTYPE
   TRUST_REMOTE_CODE
   BATCH_SIZE
@@ -107,6 +125,7 @@ for ((RANK = 0; RANK < WORLD_SIZE; RANK++)); do
   CONVERT_ARGS=(
     --input "${INPUT}"
     --model "${MODEL}"
+    --reference_train_jsonl "${REFERENCE_TRAIN_JSONL}"
     --tau "${TAU_VALUE}"
     --backend "${BACKEND}"
     --rank "${RANK}"
