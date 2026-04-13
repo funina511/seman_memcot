@@ -72,6 +72,31 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 
 If you do not set `TAU_VALUE` yourself, `run_full_pipeline.sh` reads `${RUN_DIR}/sample_tau/tau_candidates.json` and uses `TAU_KEY` to select a candidate automatically. The default `TAU_KEY=q_0.0100` matches the 1% candidate.
 
+For the fastest smoke checks, use the local Hugging Face backend and keep the sample small:
+
+```bash
+export BACKEND=hf
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
+```
+
+With `ASSISTANT_WINDOW_SIZE=4096` and `ASSISTANT_STRIDE=1024`, each scoring pass reuses a 4096-token assistant window but only scores about 1024 fresh assistant tokens. Save per-token stride for tiny exact comparisons.
+
+Optional SGLang comparison:
+
+```bash
+export BACKEND=sglang
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
+export SGLANG_MEM_FRACTION_STATIC=0.65
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=1
+```
+
 ## Step 1 Estimate Tau
 
 The tau-estimation wrapper does two things:
@@ -112,6 +137,17 @@ bash seman_memcot/scripts/run_estimate_tau.sh
 ```
 
 Use `BACKEND=hf` for the default local Hugging Face scoring path. Use `BACKEND=sglang` only when the current `python3` can import `sglang`; the shell wrappers now fail fast with an explicit environment hint if this check fails.
+
+`BACKEND=sglang` targets `sglang==0.4.6.post5`. For that backend, start with:
+
+```bash
+export BACKEND=sglang
+export SGLANG_MEM_FRACTION_STATIC=0.65
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=1
+```
+
+If you still see VRAM spikes, lower `SGLANG_MEM_FRACTION_STATIC` first, then reduce `SGLANG_CHUNKED_PREFILL_SIZE`.
 
 `ASSISTANT_WINDOW_SIZE=4096` keeps the scoring pass on a bounded assistant-side sliding window while preserving the full system/question prefix. `LIMIT_ROWS=2000` is a practical smoke-test limit when you want a shorter run without changing the input file. `LONG_SAMPLE_POLICY=window` keeps overlong rows in the output and tau estimate after counting them; `LONG_SAMPLE_POLICY=skip` records them in the run metadata but drops them from the written tau or shard output.
 
@@ -182,6 +218,8 @@ The Python tools write runtime metadata sidecars as `*.meta.json` files next to 
 
 These sidecars record fields such as backend, model, windowing controls, row limits, and summary counters so you can confirm a smoke run and a full run used the expected settings.
 
+The profiling sidecars also record `score_seconds_per_token`, `assistant_stride`, and `cuda_max_memory_allocated_mb`, which are the quickest signals for whether a run is compute-bound or memory-bound.
+
 ## Common Parameters
 
 These environment variables are the main knobs exposed by the shell wrappers:
@@ -202,6 +240,7 @@ These environment variables are the main knobs exposed by the shell wrappers:
 - `MIN_STEP_TOKENS`: minimum token gap between cut boundaries.
 - `MIN_STEP_CHARS`: minimum character length for a split segment.
 - `ASSISTANT_WINDOW_SIZE`: assistant-side scoring window size forwarded to both Python tools, default `4096`.
+- `ASSISTANT_STRIDE`: optional assistant-side stride between scoring windows; defaults to one quarter of `ASSISTANT_WINDOW_SIZE`.
 - `LIMIT_ROWS`: optional top-of-file cap for smoke tests and quick reruns.
 - `LONG_SAMPLE_POLICY`: `window` keeps overlong rows after counting them; `skip` drops them from the written output while still counting them in metadata.
 - `TAU_KEY`: full-pipeline helper key used to pick a tau from `${RUN_DIR}/sample_tau/tau_candidates.json` when `TAU_VALUE` is unset. Default `q_0.0100`.
@@ -232,6 +271,8 @@ export GPU_IDS=0,1
 export WORLD_SIZE=2
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0100
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -244,3 +285,16 @@ Expected key outputs:
 - `${RUN_DIR}/progress/shard_0.json`
 - `${RUN_DIR}/logs/shard_0.log`
 - `${RUN_DIR}/merged/train.jsonl`
+
+Optional SGLang comparison:
+
+```bash
+export BACKEND=sglang
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
+export SGLANG_MEM_FRACTION_STATIC=0.65
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=1
+```

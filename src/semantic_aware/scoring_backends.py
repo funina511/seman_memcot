@@ -24,6 +24,7 @@ class ScoringBackend(Protocol):
         question: str,
         assistant_text: str,
         assistant_window_size: int = 4096,
+        assistant_stride: int | None = None,
     ) -> tuple[list[int], list[tuple[int, int]], list[float]]:
         """Return assistant token ids, offsets, and confidences."""
 
@@ -72,6 +73,7 @@ class HFScoringBackend:
         question,
         assistant_text,
         assistant_window_size=4096,
+        assistant_stride=None,
     ):
         from semantic_aware.scoring import (
             compute_token_confidences_windowed,
@@ -89,6 +91,7 @@ class HFScoringBackend:
             prefix_ids=prefix_ids,
             assistant_ids=assistant_token_ids,
             assistant_window_size=assistant_window_size,
+            assistant_stride=assistant_stride,
         )
         _validate_scoring_output(
             assistant_token_ids,
@@ -117,16 +120,20 @@ class SGLangScoringBackend:
         question,
         assistant_text,
         assistant_window_size,
+        assistant_stride=None,
     ):
         scorer = getattr(self.model, "score_assistant_tokens", None)
         if callable(scorer):
-            return scorer(
+            scorer_kwargs = dict(
                 system_prompt=system_prompt,
                 question=question,
                 assistant_text=assistant_text,
                 assistant_window_size=assistant_window_size,
                 tokenizer=self.tokenizer,
             )
+            if assistant_stride is not None:
+                scorer_kwargs["assistant_stride"] = assistant_stride
+            return scorer(**scorer_kwargs)
 
         # Prefer an attached client scorer when available; only import sglang for
         # the module-level fallback path so local stubs stay usable in tests.
@@ -139,7 +146,7 @@ class SGLangScoringBackend:
 
         module_scorer = getattr(sglang, "score_assistant_tokens", None)
         if callable(module_scorer):
-            return module_scorer(
+            scorer_kwargs = dict(
                 model=self.model,
                 tokenizer=self.tokenizer,
                 system_prompt=system_prompt,
@@ -147,6 +154,9 @@ class SGLangScoringBackend:
                 assistant_text=assistant_text,
                 assistant_window_size=assistant_window_size,
             )
+            if assistant_stride is not None:
+                scorer_kwargs["assistant_stride"] = assistant_stride
+            return module_scorer(**scorer_kwargs)
 
         model_type = type(self.model).__name__
         raise RuntimeError(
@@ -163,13 +173,17 @@ class SGLangScoringBackend:
         question,
         assistant_text,
         assistant_window_size=4096,
+        assistant_stride=None,
     ):
-        payload = self._score_payload(
+        payload_kwargs = dict(
             system_prompt=system_prompt,
             question=question,
             assistant_text=assistant_text,
             assistant_window_size=assistant_window_size,
         )
+        if assistant_stride is not None:
+            payload_kwargs["assistant_stride"] = assistant_stride
+        payload = self._score_payload(**payload_kwargs)
         raw_token_ids, raw_offsets, raw_confidences = _unpack_payload(payload)
         token_ids = list(raw_token_ids)
         offsets = [tuple(offset) for offset in raw_offsets]
@@ -211,6 +225,32 @@ def _parse_prompt_logprob_item(item):
         head = item[0]
         if isinstance(head, (int, float)):
             return float(head)
+    return None
+
+
+def _get_prompt_logprob_item(prompt_logprobs, *, position, full_input_len, logprob_start_len):
+    """Fetch one prompt logprob from absolute or truncated SGLang payloads.
+
+    Some SGLang runtimes return ``input_token_logprobs`` aligned to the full
+    prompt length, while others return a truncated slice that starts at
+    ``logprob_start_len``. This helper keeps the adapter agnostic to either
+    layout.
+    """
+    if not isinstance(prompt_logprobs, list):
+        return None
+
+    truncated_len = max(0, full_input_len - logprob_start_len)
+    if logprob_start_len >= 0 and len(prompt_logprobs) == truncated_len:
+        truncated_index = position - logprob_start_len
+        if 0 <= truncated_index < len(prompt_logprobs):
+            return prompt_logprobs[truncated_index]
+
+    if 0 <= position < len(prompt_logprobs):
+        return prompt_logprobs[position]
+
+    truncated_index = position - logprob_start_len
+    if 0 <= truncated_index < len(prompt_logprobs):
+        return prompt_logprobs[truncated_index]
     return None
 
 
@@ -296,13 +336,27 @@ class _SGLangEngineAdapter:
                 engine_kwargs["mem_fraction_static"] = float(mem_fraction_static)
             except ValueError:
                 pass
+        chunked_prefill_size = os.environ.get("SGLANG_CHUNKED_PREFILL_SIZE")
+        if chunked_prefill_size:
+            try:
+                engine_kwargs["chunked_prefill_size"] = int(chunked_prefill_size)
+            except ValueError:
+                pass
+        if os.environ.get("SGLANG_DISABLE_RADIX_CACHE", "0") == "1":
+            engine_kwargs["disable_radix_cache"] = True
+        cuda_graph_max_bs = os.environ.get("SGLANG_CUDA_GRAPH_MAX_BS")
+        if cuda_graph_max_bs:
+            try:
+                engine_kwargs["cuda_graph_max_bs"] = int(cuda_graph_max_bs)
+            except ValueError:
+                pass
 
         self._engine = sgl.Engine(**engine_kwargs)
         self._tokenizer = tokenizer
         self._runner = _AsyncLoopRunner()
 
-    async def _async_generate_with_logprobs(self, prompt, top_logprobs_num=1):
-        sampling_params = {
+    def _build_sampling_params(self):
+        return {
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": -1,
@@ -310,33 +364,79 @@ class _SGLangEngineAdapter:
             "skip_special_tokens": False,
         }
 
+    async def _async_generate_with_logprobs(self, *, input_ids, logprob_start_len):
+        sampling_params = self._build_sampling_params()
+
         async_generate = getattr(self._engine, "async_generate", None)
         if callable(async_generate):
             try:
                 outputs = await async_generate(
-                    [prompt],
+                    input_ids=[input_ids],
                     sampling_params=sampling_params,
                     return_logprob=True,
-                    logprob_start_len=0,
-                    top_logprobs_num=top_logprobs_num,
+                    logprob_start_len=logprob_start_len,
+                    top_logprobs_num=0,
                 )
             except TypeError:
                 fallback_sampling = dict(sampling_params)
                 fallback_sampling.update(
                     {
                         "return_logprob": True,
-                        "logprob_start_len": 0,
-                        "top_logprobs_num": top_logprobs_num,
+                        "logprob_start_len": logprob_start_len,
+                        "top_logprobs_num": 0,
                     }
                 )
                 outputs = await async_generate(
-                    [prompt],
+                    input_ids=[input_ids],
                     sampling_params=fallback_sampling,
                 )
             return _coerce_outputs(outputs)
 
         raise RuntimeError(
             "sglang engine does not expose async_generate; unsupported sglang runtime API."
+        )
+
+    def _generate_with_logprobs(self, *, input_ids, logprob_start_len):
+        sampling_params = self._build_sampling_params()
+        generate = getattr(self._engine, "generate", None)
+        if callable(generate):
+            try:
+                return _coerce_outputs(
+                    generate(
+                        input_ids=[input_ids],
+                        sampling_params=sampling_params,
+                        return_logprob=True,
+                        logprob_start_len=logprob_start_len,
+                        top_logprobs_num=0,
+                    )
+                )
+            except TypeError:
+                compatible_sampling = dict(sampling_params)
+                compatible_sampling.update(
+                    {
+                        "return_logprob": True,
+                        "logprob_start_len": logprob_start_len,
+                        "top_logprobs_num": 0,
+                    }
+                )
+                return _coerce_outputs(
+                    generate(
+                        input_ids=[input_ids],
+                        sampling_params=compatible_sampling,
+                    )
+                )
+
+        async_generate = getattr(self._engine, "async_generate", None)
+        if callable(async_generate):
+            return self._runner.run(
+                self._async_generate_with_logprobs(
+                    input_ids=input_ids,
+                    logprob_start_len=logprob_start_len,
+                )
+            )
+
+        raise RuntimeError(
+            "sglang engine exposes neither generate nor async_generate; unsupported runtime API."
         )
 
     def score_assistant_tokens(
@@ -346,6 +446,7 @@ class _SGLangEngineAdapter:
         question,
         assistant_text,
         assistant_window_size=4096,
+        assistant_stride=None,
         tokenizer=None,
     ):
         tokenizer = tokenizer or self._tokenizer
@@ -372,6 +473,7 @@ class _SGLangEngineAdapter:
             prefix_ids=prefix_ids,
             assistant_ids=assistant_token_ids,
             assistant_window_size=assistant_window_size,
+            assistant_stride=assistant_stride,
         )
 
         confidences = []
@@ -379,9 +481,12 @@ class _SGLangEngineAdapter:
         # Mirror HF windowed scoring semantics: each pass scores only the fresh tail.
         for window in windows:
             full_input_ids = window.prefix_ids + window.assistant_ids
-            prompt_text = tokenizer.decode(full_input_ids, skip_special_tokens=False)
-
-            outputs = self._runner.run(self._async_generate_with_logprobs(prompt_text))
+            fresh_start_position = len(window.prefix_ids) + window.assistant_start_index
+            logprob_start_len = max(0, fresh_start_position - 1)
+            outputs = self._generate_with_logprobs(
+                input_ids=full_input_ids,
+                logprob_start_len=logprob_start_len,
+            )
             if not outputs:
                 raise RuntimeError("sglang scoring returned no outputs for prompt logprobs.")
 
@@ -391,7 +496,12 @@ class _SGLangEngineAdapter:
                 len(full_input_ids),
             )
             for position in fresh_positions:
-                item = prompt_logprobs[position] if position < len(prompt_logprobs) else None
+                item = _get_prompt_logprob_item(
+                    prompt_logprobs,
+                    position=position,
+                    full_input_len=len(full_input_ids),
+                    logprob_start_len=logprob_start_len,
+                )
                 logp = _parse_prompt_logprob_item(item)
                 if logp is None:
                     logp = MAX_NEG_LOGPROB

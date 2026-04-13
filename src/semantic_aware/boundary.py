@@ -1,6 +1,12 @@
 """AdaptiveStep boundary selection helpers."""
 
 
+def _is_inside_word(text, cut_char):
+    if cut_char <= 0 or cut_char >= len(text):
+        return False
+    return text[cut_char - 1].isalnum() and text[cut_char].isalnum()
+
+
 def is_valid_segment_text(text, min_meaningful_chars=3):
     """Return whether text looks substantial enough to stand alone."""
     stripped = text.strip()
@@ -83,6 +89,8 @@ def split_text_by_token_boundaries(text, offsets, boundaries, min_step_chars):
     start_char = 0
     for boundary in boundaries:
         _, end_char = offsets[boundary]
+        if _is_inside_word(text, end_char):
+            continue
         if end_char - start_char < min_step_chars:
             continue
         piece = text[start_char:end_char]

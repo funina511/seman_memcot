@@ -41,7 +41,7 @@ seman_memcot/
 
 ## 快速开始
 
-建议先做一个前 `2000` 条的小规模试跑，确认切分效果正常。
+建议先做一个前 `200` 条的小规模试跑，确认切分效果正常。
 
 ### 方案 A：一步跑完整流程
 
@@ -53,7 +53,9 @@ export BACKEND=hf
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
-export LIMIT_ROWS=2000
+export LIMIT_ROWS=200
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -65,6 +67,18 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 - 从 `tau_candidates.json` 里读取 `TAU_KEY` 对应的值
 - 启动 shard 转换
 - 合并成最终 `train.jsonl`
+
+如果你想做最快的 smoke test，推荐先用本地 Hugging Face 后端，并把样本量压小：
+
+```bash
+export BACKEND=hf
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
+```
+
+`ASSISTANT_STRIDE=1024` 表示每个窗口最多复用 `4096` 个 assistant token 上下文，但一次评分约 `1024` 个新 token。不要再使用逐 token stride，除非只是做极小样本的精确对照。
 
 ### 方案 B：分两步手动跑
 
@@ -106,6 +120,7 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 - `REFERENCE_TRAIN_JSONL`：参考训练集路径，转换输出会继承该文件对应行的全部字段，仅覆盖 `thoughts_list`
 - `BACKEND`：后端类型，常用 `BACKEND=hf` 或 `BACKEND=sglang`
 - `ASSISTANT_WINDOW_SIZE`：assistant 侧滑窗大小，默认 `4096`
+- `ASSISTANT_STRIDE`：assistant 侧滑窗步长，可选；默认是 `ASSISTANT_WINDOW_SIZE` 的四分之一
 - `LIMIT_ROWS`：只处理输入前 N 条，适合 smoke test
 - `TAU_KEY`：完整流程脚本用于自动选取 `tau` 的键，默认 `q_0.0100`
 - `TAU_VALUE`：手动转换时使用的具体阈值
@@ -115,9 +130,20 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 `BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 需要在当前 `python3` 环境可导入 `sglang`；shell 脚本会先做前置检查，不满足时会直接失败并提示切换到 sglang 环境。
 
+如果你要和 SGLang 做可选对照比较，`BACKEND=sglang` 这条路径按 `sglang==0.4.6.post5` 的 `Engine.generate` / prompt logprob 方式设计。推荐先这样设置：
+
+```bash
+export BACKEND=sglang
+export SGLANG_MEM_FRACTION_STATIC=0.65
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=1
+```
+
+如果还是出现显存跳变，先把 `SGLANG_MEM_FRACTION_STATIC` 再调低，再考虑减小 `SGLANG_CHUNKED_PREFILL_SIZE`。
+
 ## 推荐部署方式
 
-### 1. 先做 2000 条 smoke test
+### 1. 先做 200 条 smoke test
 
 ```bash
 export INPUT=bs17k.jsonl
@@ -128,8 +154,9 @@ export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0200
-export SGLANG_MEM_FRACTION_STATIC=0.65
 bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
@@ -208,6 +235,8 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 这些 `*.meta.json` sidecar 会记录 backend、model、窗口参数、limit_rows、计数统计等运行时元数据，方便确认 smoke test 和正式跑的配置一致。
 
+每个 `*.meta.json` 里还会写入 `score_seconds_per_token`、`assistant_stride`、`cuda_max_memory_allocated_mb`。如果 `200` 条 smoke test 还是很慢，先对比 HF 和 SGLang 的 `score_seconds_per_token`，再看是不是有很多超长样本或异常窗口数。
+
 ## 出问题时先看哪里
 
 最先看这几个文件：
@@ -227,11 +256,13 @@ head -n 3 "${RUN_DIR}/merged/train.jsonl"
 export INPUT=bs17k.jsonl
 export RUN_DIR=runs/bs17k_smoke
 export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-export BACKEND=sglang
+export BACKEND=hf
 export GPU_IDS=0,1,2,3
 export WORLD_SIZE=4
-export LIMIT_ROWS=500
+export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -244,6 +275,19 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 - `${RUN_DIR}/progress/shard_0.json`
 - `${RUN_DIR}/logs/shard_0.log`
 - `${RUN_DIR}/merged/train.jsonl`
+
+可选：SGLang 对照比较
+
+```bash
+export BACKEND=sglang
+export LIMIT_ROWS=200
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=skip
+export SGLANG_MEM_FRACTION_STATIC=0.65
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=1
+```
 
 ## 当前实现状态
 

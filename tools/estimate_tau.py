@@ -16,7 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 from semantic_aware.io_utils import iter_jsonl, read_json, write_json, write_runtime_metadata
 from semantic_aware.protected_tokens import build_cuttable_mask, find_protected_spans
 from semantic_aware.role_extract import extract_roles
-from semantic_aware.scoring import tokenize_prompt_and_assistant
+from semantic_aware.scoring import count_scoring_windows, tokenize_prompt_and_assistant
 from semantic_aware.scoring_backends import init_scoring_backend
 from semantic_aware.tau_estimation import compute_quantile, estimate_tau_from_records
 
@@ -57,6 +57,12 @@ def parse_args():
         help="Maximum assistant tokens scored per teacher-forcing window",
     )
     parser.add_argument(
+        "--assistant_stride",
+        default=None,
+        type=int,
+        help="Optional stride between scoring windows; defaults to one quarter of the window size",
+    )
+    parser.add_argument(
         "--limit_rows",
         default=None,
         type=int,
@@ -80,6 +86,16 @@ def _select_rank_indices(sampled_indices, *, rank, world_size):
     }
 
 
+def _cuda_peak_memory_mb():
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    return round(torch.cuda.max_memory_allocated() / (1024 * 1024), 3)
+
+
 def _build_runtime_metadata(
     *,
     args,
@@ -87,8 +103,12 @@ def _build_runtime_metadata(
     rows_scored,
     sample_count,
     token_count,
+    window_count,
+    scored_token_count,
     overlong,
     score_seconds_total,
+    score_seconds_per_token,
+    cuda_max_memory_allocated_mb,
 ):
     score_seconds_avg = score_seconds_total / rows_scored if rows_scored else 0.0
     return {
@@ -103,10 +123,15 @@ def _build_runtime_metadata(
         "rows_scored": rows_scored,
         "sample_count": sample_count,
         "token_count": token_count,
+        "window_count": window_count,
+        "scored_token_count": scored_token_count,
         "num_overlong": overlong,
         "score_seconds_total": round(score_seconds_total, 6),
         "score_seconds_avg": round(score_seconds_avg, 6),
+        "score_seconds_per_token": round(score_seconds_per_token, 8),
+        "cuda_max_memory_allocated_mb": cuda_max_memory_allocated_mb,
         "assistant_window_size": args.assistant_window_size,
+        "assistant_stride": args.assistant_stride,
         "long_sample_policy": args.long_sample_policy,
     }
 
@@ -144,7 +169,17 @@ def main():
     rows_seen = 0
     rows_scored = 0
     token_count = 0
+    window_count = 0
+    scored_token_count = 0
     score_seconds_total = 0.0
+
+    try:
+        import torch
+    except ImportError:
+        pass
+    else:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
     for source_idx, obj in enumerate(iter_jsonl(args.input, limit_rows=args.limit_rows)):
         if source_idx not in assigned_indices:
@@ -175,10 +210,18 @@ def main():
             question=question,
             assistant_text=assistant,
             assistant_window_size=args.assistant_window_size,
+            assistant_stride=args.assistant_stride,
         )
         score_seconds_total += time.perf_counter() - started
         rows_scored += 1
         token_count += len(token_ids)
+        window_count += count_scoring_windows(
+            prefix_ids=[],
+            assistant_ids=token_ids,
+            assistant_window_size=args.assistant_window_size,
+            assistant_stride=args.assistant_stride,
+        )
+        scored_token_count += len(confidences)
         if len(token_ids) > args.max_length:
             overlong += 1
             # `skip` drops already-scored overlong rows from tau estimation while keeping their counts.
@@ -205,14 +248,20 @@ def main():
             }
         )
 
+    score_seconds_per_token = score_seconds_total / token_count if token_count else 0.0
+    cuda_max_memory_allocated_mb = _cuda_peak_memory_mb()
     runtime_metadata = _build_runtime_metadata(
         args=args,
         rows_seen=rows_seen,
         rows_scored=rows_scored,
         sample_count=len(records),
         token_count=token_count,
+        window_count=window_count,
+        scored_token_count=scored_token_count,
         overlong=overlong,
         score_seconds_total=score_seconds_total,
+        score_seconds_per_token=score_seconds_per_token,
+        cuda_max_memory_allocated_mb=cuda_max_memory_allocated_mb,
     )
 
     if args.partial_output:
