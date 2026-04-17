@@ -47,15 +47,15 @@ seman_memcot/
 
 ```bash
 export INPUT=/data/bs17k.jsonl
-export RUN_DIR=runs/bs17k_smoke
+export RUN_DIR=runs/bs17k-seman
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-export BACKEND=hf
+export BACKEND=sglang
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=200
 export ASSISTANT_STRIDE=1024
-export LONG_SAMPLE_POLICY=skip
+export LONG_SAMPLE_POLICY=window
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -86,7 +86,7 @@ export LONG_SAMPLE_POLICY=skip
 
 ```bash
 export INPUT=/data/bs17k.jsonl
-export RUN_DIR=runs/bs17k_smoke
+export RUN_DIR=runs/bs17k-seman
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
 export GPU_IDS=0,1
@@ -101,7 +101,6 @@ bash seman_memcot/scripts/run_estimate_tau.sh
 ```bash
 export BACKEND=hf
 export TAU_VALUE=0.557
-export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 
 bash seman_memcot/scripts/run_convert_4gpu.sh
@@ -124,8 +123,8 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 - `LIMIT_ROWS`：只处理输入前 N 条，适合 smoke test
 - `TAU_KEY`：完整流程脚本用于自动选取 `tau` 的键，默认 `q_0.0100`
 - `TAU_VALUE`：手动转换时使用的具体阈值
-- `WORLD_SIZE`：转换阶段并行 shard 数
-- `GPU_IDS`：和 `WORLD_SIZE` 对齐的显卡列表，比如 `0,1,2,3`；tau 估计阶段也会按这个列表一张卡起一个 worker
+- `WORLD_SIZE`：兼容保留参数；转换阶段会自动按 `GPU_IDS` 数量对齐 shard 数
+- `GPU_IDS`：转换与 tau 估计都会按这个列表并行；例如 `0,1,2,3`
 - `LONG_SAMPLE_POLICY`：超长样本策略，`window` 或 `skip`
 
 `BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 需要在当前 `python3` 环境可导入 `sglang`；shell 脚本会先做前置检查，不满足时会直接失败并提示切换到 sglang 环境。
@@ -147,10 +146,9 @@ export SGLANG_CUDA_GRAPH_MAX_BS=1
 
 ```bash
 export INPUT=bs17k.jsonl
-export RUN_DIR=runs/bs17k_smoke
+export RUN_DIR=runs/bs17k-seman
 export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
-export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
@@ -205,6 +203,7 @@ export LIMIT_ROWS=2000
 
 - `progress/shard_<rank>.json` 记录每个 shard 的当前位置
 - `convert_runtime.env` 记录这次运行的关键参数，避免你下次用不同参数续跑时把结果混在一起
+- 转换脚本会按 `GPU_IDS` 自动设置 `WORLD_SIZE`，因此同一个 `RUN_DIR` 续跑时不需要手动对齐 `WORLD_SIZE`
 
 如果你用同一个 `RUN_DIR` 重新执行：
 
@@ -214,6 +213,14 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 脚本会先检查参数是否和上次一致；如果不一致，会直接报错，让你换新的 `RUN_DIR` 或恢复原参数。
 这里的保护项现在也包含 `BACKEND`，避免同一个输出目录里混入不同后端打分结果。
+
+另外，转换阶段还会做 progress 与 shard 输出的一致性保护：
+
+- 如果 `progress/shard_<rank>.json` 缺失，但 `export/shard_<rank>.jsonl` 已有内容，会直接失败（防止重复 append）
+- 如果 `num_written` 与 shard 实际行数不一致，会直接失败
+- 如果 progress 文件 JSON 损坏，会先重命名为 `.corrupt` 备份，然后直接失败
+
+出现以上报错时，先修复或删除对应 shard 的 `progress` 与 `export` 文件，再重新执行该 `RUN_DIR`。
 
 ## 常见输出位置
 
@@ -254,15 +261,14 @@ head -n 3 "${RUN_DIR}/merged/train.jsonl"
 
 ```bash
 export INPUT=bs17k.jsonl
-export RUN_DIR=runs/bs17k_smoke
+export RUN_DIR=runs/bs17k-smoke
 export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
 export GPU_IDS=0,1,2,3
-export WORLD_SIZE=4
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
 export ASSISTANT_STRIDE=1024
-export LONG_SAMPLE_POLICY=skip
+export LONG_SAMPLE_POLICY=window
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -279,16 +285,37 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 可选：SGLang 对照比较
 
 ```bash
+export INPUT=bs17k.jsonl
+export RUN_DIR=runs/bs17k_smoke
+export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=sglang
+export GPU_IDS=4,5
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
 export ASSISTANT_STRIDE=1024
-export LONG_SAMPLE_POLICY=skip
-export SGLANG_MEM_FRACTION_STATIC=0.65
+export LONG_SAMPLE_POLICY=window
+export SGLANG_MEM_FRACTION_STATIC=0.72
 export SGLANG_CHUNKED_PREFILL_SIZE=2048
-export SGLANG_CUDA_GRAPH_MAX_BS=1
+export SGLANG_CUDA_GRAPH_MAX_BS=4
+export TAU_KEY=q_0.0200
+
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
+export INPUT=bs17k.jsonl
+export RUN_DIR=runs/bs17k_seman
+export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export BACKEND=sglang
+export GPU_IDS=4,5
+unset LIMIT_ROWS
+export ASSISTANT_WINDOW_SIZE=4096
+export ASSISTANT_STRIDE=1024
+export LONG_SAMPLE_POLICY=window
+export SGLANG_MEM_FRACTION_STATIC=0.72
+export SGLANG_CHUNKED_PREFILL_SIZE=2048
+export SGLANG_CUDA_GRAPH_MAX_BS=4
+export TAU_KEY=q_0.0200
+bash seman_memcot/scripts/run_full_pipeline.sh
 ## 当前实现状态
 
 这套 `seman_memcot` 流程目前已经覆盖：

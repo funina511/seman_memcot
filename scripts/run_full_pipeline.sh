@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INPUT="${INPUT:-/path/to/bs17k.jsonl}"
-RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
+RUN_DIR="${RUN_DIR:-runs/bs17k-seman}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
 REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"

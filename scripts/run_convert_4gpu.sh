@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 INPUT="${INPUT:-/path/to/bs17k.jsonl}"
-RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
+RUN_DIR="${RUN_DIR:-runs/bs17k-seman}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
 REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"
@@ -78,10 +78,15 @@ CONFIG_KEYS=(
 )
 
 IFS=',' read -r -a GPUS <<< "${GPU_IDS}"
-# Keep rank-to-device assignment explicit: GPU_IDS must be a comma-separated list.
-if (( ${#GPUS[@]} != WORLD_SIZE )); then
-  echo "ERROR: WORLD_SIZE=${WORLD_SIZE} requires exactly ${WORLD_SIZE} GPU_IDS entries, got ${#GPUS[@]} from '${GPU_IDS}'." >&2
+REQUESTED_WORLD_SIZE="${WORLD_SIZE}"
+# Conversion shard count always follows the GPU list length.
+WORLD_SIZE="${#GPUS[@]}"
+if (( WORLD_SIZE <= 0 )); then
+  echo "ERROR: GPU_IDS produced no usable devices. Please set GPU_IDS like '0,1,2,3'." >&2
   exit 1
+fi
+if [[ -n "${REQUESTED_WORLD_SIZE}" && "${REQUESTED_WORLD_SIZE}" != "${WORLD_SIZE}" ]]; then
+  echo "INFO: WORLD_SIZE=${REQUESTED_WORLD_SIZE} was overridden to ${WORLD_SIZE} based on GPU_IDS='${GPU_IDS}'." >&2
 fi
 
 write_config_snapshot() {

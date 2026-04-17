@@ -27,6 +27,72 @@ from semantic_aware.scoring import count_scoring_windows, tokenize_prompt_and_as
 from semantic_aware.scoring_backends import init_scoring_backend
 
 
+def _count_output_rows(path):
+    row_count = 0
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                row_count += 1
+    return row_count
+
+
+def _validate_resume_consistency(*, progress, progress_exists, output_rows, output_path, progress_path, args):
+    if not progress_exists:
+        if output_rows > 0:
+            raise RuntimeError(
+                "Progress file is missing but shard output already exists. "
+                f"output={output_path} has {output_rows} rows while progress={progress_path} is absent. "
+                "Refusing to append because this can duplicate data. "
+                "Please restore/remove both files for this shard, then rerun."
+            )
+        return
+
+    expected_written = progress.get("num_written")
+    if expected_written is None:
+        raise RuntimeError(
+            f"Progress file {progress_path} is missing required key 'num_written'. "
+            "Please repair/remove this shard progress before resuming."
+        )
+    if expected_written != output_rows:
+        raise RuntimeError(
+            "Progress/output mismatch detected for shard resume: "
+            f"progress num_written={expected_written}, output rows={output_rows}. "
+            f"progress={progress_path}, output={output_path}. "
+            "Refusing to append to avoid duplicate samples."
+        )
+
+    saved_rank = progress.get("rank")
+    if saved_rank is not None and saved_rank != args.rank:
+        raise RuntimeError(
+            f"Progress rank mismatch: saved rank={saved_rank}, current rank={args.rank}. "
+            f"progress={progress_path}."
+        )
+    saved_world_size = progress.get("world_size")
+    if saved_world_size is not None and saved_world_size != args.world_size:
+        raise RuntimeError(
+            f"Progress world_size mismatch: saved world_size={saved_world_size}, "
+            f"current world_size={args.world_size}. progress={progress_path}."
+        )
+
+    rows_seen = progress.get("rows_seen")
+    if rows_seen is not None and rows_seen < expected_written:
+        raise RuntimeError(
+            f"Progress rows_seen={rows_seen} is smaller than num_written={expected_written}. "
+            f"progress={progress_path}."
+        )
+    rows_scored = progress.get("rows_scored")
+    if rows_scored is not None and rows_scored < expected_written:
+        raise RuntimeError(
+            f"Progress rows_scored={rows_scored} is smaller than num_written={expected_written}. "
+            f"progress={progress_path}."
+        )
+
+    if progress.get("finished") and progress.get("last_source_idx", -1) < 0 and expected_written > 0:
+        raise RuntimeError(
+            f"Progress is marked finished but last_source_idx is invalid. progress={progress_path}."
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Input JSONL path")
@@ -93,12 +159,23 @@ def _cuda_peak_memory_mb():
 def main():
     args = parse_args()
     output_path = Path(args.output)
+    progress_path = Path(args.progress)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.touch(exist_ok=True)
     if not Path(args.reference_train_jsonl).exists():
         raise ValueError(f"reference_train_jsonl not found: {args.reference_train_jsonl}")
 
+    progress_exists = progress_path.exists()
     progress = load_progress(args.progress)
+    output_rows = _count_output_rows(args.output)
+    _validate_resume_consistency(
+        progress=progress,
+        progress_exists=progress_exists,
+        output_rows=output_rows,
+        output_path=output_path,
+        progress_path=progress_path,
+        args=args,
+    )
     if progress.get("finished"):
         # A finished shard should be a cheap no-op on resume.
         return

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
-import sys
 
 
 def iter_jsonl(path, limit_rows=None):
@@ -61,18 +60,18 @@ def load_progress(path):
         return {}
     try:
         return read_json(progress_path)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
         recovery_path = progress_path.with_name(f"{progress_path.name}.corrupt")
         suffix = 1
         while recovery_path.exists():
             recovery_path = progress_path.with_name(f"{progress_path.name}.corrupt.{suffix}")
             suffix += 1
         progress_path.replace(recovery_path)
-        print(
-            f"Warning: progress file {progress_path} was corrupt and was moved to {recovery_path}; resuming from empty progress.",
-            file=sys.stderr,
-        )
-        return {}
+        raise RuntimeError(
+            f"Progress file {progress_path} was corrupt and moved to {recovery_path}. "
+            "Refusing to resume automatically because this can duplicate shard outputs. "
+            "Please repair/remove the progress and shard files, then rerun."
+        ) from error
 
 
 def save_progress(path, progress):

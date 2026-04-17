@@ -398,6 +398,19 @@ class _SGLangEngineAdapter:
 
     def _generate_with_logprobs(self, *, input_ids, logprob_start_len):
         sampling_params = self._build_sampling_params()
+
+        # Prefer async_generate because some SGLang runtimes expose a sync
+        # generate() wrapper that assumes an event loop already exists in the
+        # caller thread (uvloop raises otherwise).
+        async_generate = getattr(self._engine, "async_generate", None)
+        if callable(async_generate):
+            return self._runner.run(
+                self._async_generate_with_logprobs(
+                    input_ids=input_ids,
+                    logprob_start_len=logprob_start_len,
+                )
+            )
+
         generate = getattr(self._engine, "generate", None)
         if callable(generate):
             try:
@@ -425,15 +438,6 @@ class _SGLangEngineAdapter:
                         sampling_params=compatible_sampling,
                     )
                 )
-
-        async_generate = getattr(self._engine, "async_generate", None)
-        if callable(async_generate):
-            return self._runner.run(
-                self._async_generate_with_logprobs(
-                    input_ids=input_ids,
-                    logprob_start_len=logprob_start_len,
-                )
-            )
 
         raise RuntimeError(
             "sglang engine exposes neither generate nor async_generate; unsupported runtime API."

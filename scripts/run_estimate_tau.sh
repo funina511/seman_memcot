@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 INPUT="${INPUT:-/path/to/bs17k.jsonl}"
-RUN_DIR="${RUN_DIR:-runs/bs17k_adaptivestep}"
+RUN_DIR="${RUN_DIR:-runs/bs17k-seman}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
 SAMPLE_SIZE="${SAMPLE_SIZE:-1500}"
@@ -91,7 +91,19 @@ for rank in "${!PIDS[@]}"; do
   fi
 done
 
+mapfile -t TAU_PARTIAL_INPUTS < <(
+  find "${RUN_DIR}/sample_tau" -maxdepth 1 -type f \
+    -name 'tau_candidates.rank*.json' \
+    ! -name '*.meta.json' \
+    | sort
+)
+
+if [[ "${#TAU_PARTIAL_INPUTS[@]}" -eq 0 ]]; then
+  echo "ERROR: No tau partial JSON files found under ${RUN_DIR}/sample_tau." >&2
+  exit 1
+fi
+
 python3 "${ROOT_DIR}/tools/merge_tau_candidates.py" \
-  --inputs "${RUN_DIR}"/sample_tau/tau_candidates.rank*.json \
+  --inputs "${TAU_PARTIAL_INPUTS[@]}" \
   --output "${RUN_DIR}/sample_tau/tau_candidates.json" \
   --tau_quantiles "${TAU_QUANTILES}"
