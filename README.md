@@ -72,7 +72,7 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 
 If you do not set `TAU_VALUE` yourself, `run_full_pipeline.sh` reads `${RUN_DIR}/sample_tau/tau_candidates.json` and uses `TAU_KEY` to select a candidate automatically. The default `TAU_KEY=q_0.0100` matches the 1% candidate.
 
-For the fastest smoke checks, use the local Hugging Face backend and keep the sample small:
+For the fastest correctness smoke checks, use the local Hugging Face backend and keep the sample small:
 
 ```bash
 export BACKEND=hf
@@ -83,6 +83,13 @@ export LONG_SAMPLE_POLICY=skip
 ```
 
 With `ASSISTANT_WINDOW_SIZE=4096` and `ASSISTANT_STRIDE=1024`, each scoring pass reuses a 4096-token assistant window but only scores about 1024 fresh assistant tokens. Save per-token stride for tiny exact comparisons.
+
+For this first HF smoke pass, focus on segmentation correctness rather than throughput:
+
+- protected/control tokens should remain intact
+- ordinary words and identifiers such as `length` or `max_length` should not be split internally
+- hyphenated compounds such as `step-by-step` should not be cut inside the compound
+- compact formula-like fragments such as `x+y=2`, `n->n+1`, and `a/b` should remain meaningful segments
 
 Optional SGLang comparison:
 
@@ -151,6 +158,8 @@ If you still see VRAM spikes, lower `SGLANG_MEM_FRACTION_STATIC` first, then red
 
 `ASSISTANT_WINDOW_SIZE=4096` keeps the scoring pass on a bounded assistant-side sliding window while preserving the full system/question prefix. `LIMIT_ROWS=2000` is a practical smoke-test limit when you want a shorter run without changing the input file. `LONG_SAMPLE_POLICY=window` keeps overlong rows in the output and tau estimate after counting them; `LONG_SAMPLE_POLICY=skip` records them in the run metadata but drops them from the written tau or shard output.
 
+One subtlety in the current boundary protection: if a low-confidence cut lands inside a word, the boundary layer first tries to relocate to a nearby safe cut instead of keeping the bad internal split. That relocation window is currently an internal default in `boundary.py`, not a shell-exposed tuning knob.
+
 When `LIMIT_ROWS` is smaller than `SAMPLE_SIZE`, `run_estimate_tau.sh` automatically caps the sampling count to the same top-of-file subset so smoke-test runs do not fail with `sample_size > total_rows`.
 
 Inspect `${RUN_DIR}/sample_tau/tau_candidates.json` and choose the tau value you want to use for conversion.
@@ -185,6 +194,12 @@ Each worker writes:
 - `${RUN_DIR}/logs/shard_<rank>.log`
 
 Shard conversion inherits non-`thoughts_list` fields from `REFERENCE_TRAIN_JSONL` row-by-row, then overwrites only `thoughts_list` with the semantic split output.
+
+That means `convert_shard.py` is not rebuilding every field from the raw input JSONL. It is using `REFERENCE_TRAIN_JSONL` as the source of truth for `system_prompt`, `question`, and `gt_output`, then replacing only `thoughts_list`. When an output looks suspicious, treat row alignment as an assumption to verify alongside the segmentation itself:
+
+- `INPUT` and `REFERENCE_TRAIN_JSONL` should be in the same physical row order
+- the reference row’s `gt_output` should be the assistant text you expect to re-segment
+- an odd output can come from either boundary selection or an unexpected reference row
 
 When all ranks finish successfully, the script automatically merges them into `${RUN_DIR}/merged/train.jsonl`.
 
@@ -285,6 +300,13 @@ Expected key outputs:
 - `${RUN_DIR}/progress/shard_0.json`
 - `${RUN_DIR}/logs/shard_0.log`
 - `${RUN_DIR}/merged/train.jsonl`
+
+Correctness checklist for this smoke run:
+
+- `thoughts_list` is not overly fragmented
+- protected tokens are never broken apart
+- internal cuts do not appear inside ordinary identifiers or hyphenated compounds
+- short formula-like fragments are still preserved as meaningful segments
 
 Optional SGLang comparison:
 

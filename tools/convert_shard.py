@@ -311,6 +311,8 @@ def main():
             cuttable_mask=cuttable_mask,
             tau=args.tau,
             min_step_tokens=args.min_step_tokens,
+            text=assistant,
+            offsets=offsets,
         )
         thoughts_list = split_text_by_token_boundaries(
             text=assistant,

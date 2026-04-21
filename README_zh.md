@@ -41,21 +41,23 @@ seman_memcot/
 
 ## 快速开始
 
-建议先做一个前 `200` 条的小规模试跑，确认切分效果正常。
+建议先做一个前 `200` 条的小规模试跑，先用 `BACKEND=hf` 确认切分正确性，再切到 `sglang` 做速度对照。
 
 ### 方案 A：一步跑完整流程
+
+如果你是第一次排查切分问题，推荐先把这条命令改成 `BACKEND=hf` + `LONG_SAMPLE_POLICY=skip`。这样更容易把“模型慢/显存跳变”和“切分逻辑异常”分开看。
 
 ```bash
 export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k-seman
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-export BACKEND=sglang
+export BACKEND=hf
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=200
 export ASSISTANT_STRIDE=1024
-export LONG_SAMPLE_POLICY=window
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -68,7 +70,7 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 - 启动 shard 转换
 - 合并成最终 `train.jsonl`
 
-如果你想做最快的 smoke test，推荐先用本地 Hugging Face 后端，并把样本量压小：
+如果你想做最快、最稳的 correctness smoke test，推荐先用本地 Hugging Face 后端，并把样本量压小：
 
 ```bash
 export BACKEND=hf
@@ -79,6 +81,13 @@ export LONG_SAMPLE_POLICY=skip
 ```
 
 `ASSISTANT_STRIDE=1024` 表示每个窗口最多复用 `4096` 个 assistant token 上下文，但一次评分约 `1024` 个新 token。不要再使用逐 token stride，除非只是做极小样本的精确对照。
+
+这条 HF smoke test 主要是为了看切分本身，而不是追求绝对吞吐。建议先确认下面这几类现象没有问题：
+
+- protected token 没有被切坏，比如 `<think>`、`<|begin_of_thought|>`、`<｜Assistant｜>`
+- 普通词/标识符没有被切成明显坏片段，比如 `length`、`max_length`
+- 连字符复合词不会被词内切坏，比如 `step-by-step`
+- 短公式或符号型推理片段仍能保留，比如 `x+y=2`、`n->n+1`、`a/b`
 
 ### 方案 B：分两步手动跑
 
@@ -129,6 +138,8 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 `BACKEND=hf` 适合默认的本地 Hugging Face 打分路径。`BACKEND=sglang` 需要在当前 `python3` 环境可导入 `sglang`；shell 脚本会先做前置检查，不满足时会直接失败并提示切换到 sglang 环境。
 
+当前边界保护还有一个需要记住的细节：如果低置信切点正好落在词内部，`boundary.py` 会优先尝试在附近寻找安全落点，而不是直接保留那个坏切点。这个“平移窗口”目前是内部默认值，不是 shell 层暴露出来的单独参数，所以 README 里不会要求你手工设置它。
+
 如果你要和 SGLang 做可选对照比较，`BACKEND=sglang` 这条路径按 `sglang==0.4.6.post5` 的 `Engine.generate` / prompt logprob 方式设计。推荐先这样设置：
 
 ```bash
@@ -162,6 +173,8 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 
 - `thoughts_list` 是否切得过碎
 - protected token 是否被切坏
+- 普通词、标识符、连字符复合词是否被词内切坏
+- 公式/符号型短片段是否被错误吞掉
 - `tau` 选得是否过粗或过细
 
 ### 2. 再做全量运行
@@ -240,6 +253,12 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 转换输出记录采用“参考继承”模式：会从 `REFERENCE_TRAIN_JSONL` 对应位置继承除 `thoughts_list` 外的字段，再写入当前语义切分得到的 `thoughts_list`。
 
+这意味着当前 `convert_shard.py` 的职责不是“重新从原始输入完整构造一条训练样本”，而是“以 `REFERENCE_TRAIN_JSONL` 为准，只替换 `thoughts_list`”。所以如果你怀疑输出异常，除了看切分本身，也要确认：
+
+- `INPUT` 和 `REFERENCE_TRAIN_JSONL` 的物理行顺序是一致的
+- `REFERENCE_TRAIN_JSONL` 里的 `gt_output` 确实是你希望被重新切分的 assistant 文本
+- 当前异常是来自边界选择，还是来自 reference 本身已经不符合预期
+
 这些 `*.meta.json` sidecar 会记录 backend、model、窗口参数、limit_rows、计数统计等运行时元数据，方便确认 smoke test 和正式跑的配置一致。
 
 每个 `*.meta.json` 里还会写入 `score_seconds_per_token`、`assistant_stride`、`cuda_max_memory_allocated_mb`。如果 `200` 条 smoke test 还是很慢，先对比 HF 和 SGLang 的 `score_seconds_per_token`，再看是不是有很多超长样本或异常窗口数。
@@ -268,7 +287,7 @@ export GPU_IDS=0,1,2,3
 export LIMIT_ROWS=200
 export ASSISTANT_WINDOW_SIZE=4096
 export ASSISTANT_STRIDE=1024
-export LONG_SAMPLE_POLICY=window
+export LONG_SAMPLE_POLICY=skip
 export TAU_KEY=q_0.0200
 
 bash seman_memcot/scripts/run_full_pipeline.sh
@@ -302,6 +321,9 @@ export TAU_KEY=q_0.0200
 bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
+如果上面的 200 条对照没问题，再去掉 `LIMIT_ROWS` 做全量：
+
+```bash
 export INPUT=bs17k.jsonl
 export RUN_DIR=runs/bs17k_seman
 export MODEL=model/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
@@ -315,7 +337,10 @@ export SGLANG_MEM_FRACTION_STATIC=0.72
 export SGLANG_CHUNKED_PREFILL_SIZE=2048
 export SGLANG_CUDA_GRAPH_MAX_BS=4
 export TAU_KEY=q_0.0200
+
 bash seman_memcot/scripts/run_full_pipeline.sh
+```
+
 ## 当前实现状态
 
 这套 `seman_memcot` 流程目前已经覆盖：
