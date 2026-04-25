@@ -7,6 +7,7 @@
 - `4` 卡分 shard 转换
 - 断点续跑
 - 自动读取估计出的 `tau`
+- `threshold` / `fixed` / `random` 三种切分模式
 
 如果你想看英文版总说明，可以参考 [README.md](README.md)。
 
@@ -52,6 +53,7 @@ export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k-seman
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
+export SEGMENTATION_MODE=threshold
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
 export ASSISTANT_WINDOW_SIZE=4096
@@ -65,10 +67,12 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 
 这条命令会自动完成：
 
-- 抽样并估计 `tau`
-- 从 `tau_candidates.json` 里读取 `TAU_KEY` 对应的值
+- 在 `SEGMENTATION_MODE=threshold` 时抽样并估计 `tau`
+- 在 threshold 模式下从 `tau_candidates.json` 里读取 `TAU_KEY` 对应的值
 - 启动 shard 转换
 - 合并成最终 `train.jsonl`
+
+如果设置 `SEGMENTATION_MODE=fixed` 或 `SEGMENTATION_MODE=random`，`run_full_pipeline.sh` 会跳过 tau 估计，直接进入转换。这两种模式仍然需要 `MODEL` 来加载 tokenizer、计算 assistant token offset，但不会加载完整打分后端/模型，也不需要 `TAU_VALUE`。
 
 如果你想做最快、最稳的 correctness smoke test，推荐先用本地 Hugging Face 后端，并把样本量压小：
 
@@ -98,6 +102,7 @@ export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k-seman
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
+export SEGMENTATION_MODE=threshold
 export GPU_IDS=0,1
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
@@ -109,14 +114,43 @@ bash seman_memcot/scripts/run_estimate_tau.sh
 
 ```bash
 export BACKEND=hf
+export SEGMENTATION_MODE=threshold
 export TAU_VALUE=0.557
 export GPU_IDS=0,1,2,3
 
 bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
-注意：`run_convert_4gpu.sh` 现在要求你显式设置 `TAU_VALUE`，不会再偷偷回退到旧默认值。
+注意：只有 `SEGMENTATION_MODE=threshold` 时，`run_convert_4gpu.sh` 才要求你显式设置 `TAU_VALUE`，不会再偷偷回退到旧默认值。
 另外，`run_estimate_tau.sh` 现在会按 `GPU_IDS` 里的可见卡列表，每张 GPU 启动一个 worker 来并行估计 tau；单卡时不设 `GPU_IDS` 或保留 `GPU_ID=0` 即可。
+
+固定 token 数切分示例：
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k-fixed
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export SEGMENTATION_MODE=fixed
+export FIXED_SEGMENT_TOKENS=128
+export GPU_IDS=0,1,2,3
+
+bash seman_memcot/scripts/run_convert_4gpu.sh
+```
+
+随机 token 数切分示例：
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k-random
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export SEGMENTATION_MODE=random
+export RANDOM_MIN_SEGMENT_TOKENS=64
+export RANDOM_MAX_SEGMENT_TOKENS=256
+export RANDOM_SEED=42
+export GPU_IDS=0,1,2,3
+
+bash seman_memcot/scripts/run_full_pipeline.sh
+```
 
 ## 常用参数
 
@@ -127,11 +161,16 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 - `MODEL`：用于 teacher forcing 打分的模型
 - `REFERENCE_TRAIN_JSONL`：参考训练集路径，转换输出会继承该文件对应行的全部字段，仅覆盖 `thoughts_list`
 - `BACKEND`：后端类型，常用 `BACKEND=hf` 或 `BACKEND=sglang`
+- `SEGMENTATION_MODE`：切分模式，`threshold`、`fixed` 或 `random`，默认 `threshold`
+- `FIXED_SEGMENT_TOKENS`：fixed 模式的 assistant token 间隔，默认 `128`
+- `RANDOM_MIN_SEGMENT_TOKENS`：random 模式最小段长，默认 `64`
+- `RANDOM_MAX_SEGMENT_TOKENS`：random 模式最大段长，默认 `256`
+- `RANDOM_SEED`：random 模式基础种子，每行使用 `RANDOM_SEED + source_idx`，默认 `42`
 - `ASSISTANT_WINDOW_SIZE`：assistant 侧滑窗大小，默认 `4096`
 - `ASSISTANT_STRIDE`：assistant 侧滑窗步长，可选；默认是 `ASSISTANT_WINDOW_SIZE` 的四分之一
 - `LIMIT_ROWS`：只处理输入前 N 条，适合 smoke test
 - `TAU_KEY`：完整流程脚本用于自动选取 `tau` 的键，默认 `q_0.0100`
-- `TAU_VALUE`：手动转换时使用的具体阈值
+- `TAU_VALUE`：threshold 模式手动转换时使用的具体阈值
 - `WORLD_SIZE`：兼容保留参数；转换阶段会自动按 `GPU_IDS` 数量对齐 shard 数
 - `GPU_IDS`：转换与 tau 估计都会按这个列表并行；例如 `0,1,2,3`
 - `LONG_SAMPLE_POLICY`：超长样本策略，`window` 或 `skip`
@@ -225,7 +264,7 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 ```
 
 脚本会先检查参数是否和上次一致；如果不一致，会直接报错，让你换新的 `RUN_DIR` 或恢复原参数。
-这里的保护项现在也包含 `BACKEND`，避免同一个输出目录里混入不同后端打分结果。
+这里的保护项现在也包含 `SEGMENTATION_MODE`、fixed/random 参数和 `BACKEND`，避免同一个输出目录里混入不同切分设置或不同后端打分结果。
 
 另外，转换阶段还会做 progress 与 shard 输出的一致性保护：
 

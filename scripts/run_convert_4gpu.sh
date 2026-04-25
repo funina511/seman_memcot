@@ -9,7 +9,12 @@ RUN_DIR="${RUN_DIR:-runs/bs17k-seman}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
 REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"
+SEGMENTATION_MODE="${SEGMENTATION_MODE:-threshold}"
 TAU_VALUE="${TAU_VALUE:-}"
+FIXED_SEGMENT_TOKENS="${FIXED_SEGMENT_TOKENS:-128}"
+RANDOM_MIN_SEGMENT_TOKENS="${RANDOM_MIN_SEGMENT_TOKENS:-64}"
+RANDOM_MAX_SEGMENT_TOKENS="${RANDOM_MAX_SEGMENT_TOKENS:-256}"
+RANDOM_SEED="${RANDOM_SEED:-42}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -33,12 +38,17 @@ if [[ -n "${LIMIT_ROWS}" ]]; then
   LIMIT_ROWS_ARGS+=(--limit_rows "${LIMIT_ROWS}")
 fi
 
-if [[ -z "${TAU_VALUE}" ]]; then
-  echo "ERROR: TAU_VALUE must be set for shard conversion. Pick one from ${RUN_DIR}/sample_tau/tau_candidates.json or use run_full_pipeline.sh." >&2
+if [[ "${SEGMENTATION_MODE}" != "threshold" && "${SEGMENTATION_MODE}" != "fixed" && "${SEGMENTATION_MODE}" != "random" ]]; then
+  echo "ERROR: SEGMENTATION_MODE must be one of: threshold, fixed, random." >&2
   exit 1
 fi
 
-if [[ "${BACKEND}" == "sglang" ]]; then
+if [[ "${SEGMENTATION_MODE}" == "threshold" && -z "${TAU_VALUE}" ]]; then
+  echo "ERROR: TAU_VALUE must be set for threshold shard conversion. Pick one from ${RUN_DIR}/sample_tau/tau_candidates.json or use run_full_pipeline.sh." >&2
+  exit 1
+fi
+
+if [[ "${SEGMENTATION_MODE}" == "threshold" && "${BACKEND}" == "sglang" ]]; then
   if ! python3 - <<'PY' >/dev/null 2>&1
 import sglang
 PY
@@ -62,10 +72,15 @@ CONFIG_KEYS=(
   MODEL
   BACKEND
   REFERENCE_TRAIN_JSONL
+  SEGMENTATION_MODE
   DTYPE
   TRUST_REMOTE_CODE
   BATCH_SIZE
   TAU_VALUE
+  FIXED_SEGMENT_TOKENS
+  RANDOM_MIN_SEGMENT_TOKENS
+  RANDOM_MAX_SEGMENT_TOKENS
+  RANDOM_SEED
   WORLD_SIZE
   GPU_IDS
   MAX_LENGTH
@@ -80,6 +95,7 @@ CONFIG_KEYS=(
 IFS=',' read -r -a GPUS <<< "${GPU_IDS}"
 REQUESTED_WORLD_SIZE="${WORLD_SIZE}"
 # Conversion shard count always follows the GPU list length.
+# GPU_IDS is a comma-separated GPU list aligned with rank order.
 WORLD_SIZE="${#GPUS[@]}"
 if (( WORLD_SIZE <= 0 )); then
   echo "ERROR: GPU_IDS produced no usable devices. Please set GPU_IDS like '0,1,2,3'." >&2
@@ -134,12 +150,21 @@ trap cleanup_workers EXIT INT TERM
 
 for ((RANK = 0; RANK < WORLD_SIZE; RANK++)); do
   GPU="${GPUS[$RANK]}"
+  TAU_ARGS=()
+  if [[ "${SEGMENTATION_MODE}" == "threshold" ]]; then
+    TAU_ARGS+=(--tau "${TAU_VALUE}")
+  fi
   CONVERT_ARGS=(
     --input "${INPUT}"
     --model "${MODEL}"
     --reference_train_jsonl "${REFERENCE_TRAIN_JSONL}"
-    --tau "${TAU_VALUE}"
     --backend "${BACKEND}"
+    --segmentation_mode "${SEGMENTATION_MODE}"
+    "${TAU_ARGS[@]}"
+    --fixed_segment_tokens "${FIXED_SEGMENT_TOKENS}"
+    --random_min_segment_tokens "${RANDOM_MIN_SEGMENT_TOKENS}"
+    --random_max_segment_tokens "${RANDOM_MAX_SEGMENT_TOKENS}"
+    --random_seed "${RANDOM_SEED}"
     --rank "${RANK}"
     --world_size "${WORLD_SIZE}"
     --output "${RUN_DIR}/export/shard_${RANK}.jsonl"

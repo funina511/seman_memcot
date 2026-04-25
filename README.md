@@ -47,6 +47,7 @@ export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
+export SEGMENTATION_MODE=threshold
 export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
@@ -64,13 +65,14 @@ export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
+export SEGMENTATION_MODE=threshold
 export ASSISTANT_WINDOW_SIZE=4096
 export TAU_KEY=q_0.0100
 
 bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
-If you do not set `TAU_VALUE` yourself, `run_full_pipeline.sh` reads `${RUN_DIR}/sample_tau/tau_candidates.json` and uses `TAU_KEY` to select a candidate automatically. The default `TAU_KEY=q_0.0100` matches the 1% candidate.
+If you do not set `TAU_VALUE` yourself, `run_full_pipeline.sh` reads `${RUN_DIR}/sample_tau/tau_candidates.json` and uses `TAU_KEY` to select a candidate automatically. The default `TAU_KEY=q_0.0100` matches the 1% candidate. This tau-estimation phase only runs when `SEGMENTATION_MODE=threshold`; fixed and random modes skip it.
 
 For the fastest correctness smoke checks, use the local Hugging Face backend and keep the sample small:
 
@@ -168,7 +170,15 @@ Inspect `${RUN_DIR}/sample_tau/tau_candidates.json` and choose the tau value you
 
 The conversion wrapper launches one `convert_shard.py` worker per rank, writes per-rank JSONL shards under `${RUN_DIR}/export/`, tracks resume state under `${RUN_DIR}/progress/`, and captures logs under `${RUN_DIR}/logs/`.
 
-`TAU_VALUE` is required for `run_convert_4gpu.sh`. This keeps the two-step workflow from silently falling back to a stale default tau.
+`SEGMENTATION_MODE` controls how conversion chooses boundaries:
+
+- `threshold` keeps the semantic-aware confidence behavior and requires `TAU_VALUE`
+- `fixed` cuts after every `FIXED_SEGMENT_TOKENS` assistant tokens
+- `random` samples deterministic per-row lengths from `RANDOM_MIN_SEGMENT_TOKENS` through `RANDOM_MAX_SEGMENT_TOKENS` using `RANDOM_SEED + source_idx`
+
+`fixed` and `random` still need `MODEL` so the converter can load the model tokenizer and recover assistant token offsets, but they do not load the full scoring backend/model and do not need `TAU_VALUE`. In `run_full_pipeline.sh`, these modes skip tau estimation and go straight to conversion.
+
+`TAU_VALUE` is required for `run_convert_4gpu.sh` only when `SEGMENTATION_MODE=threshold`. This keeps the two-step threshold workflow from silently falling back to a stale default tau.
 
 Typical 4-GPU run:
 
@@ -177,6 +187,7 @@ export INPUT=/data/bs17k.jsonl
 export RUN_DIR=runs/bs17k_adaptivestep
 export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 export BACKEND=hf
+export SEGMENTATION_MODE=threshold
 export TAU_VALUE=0.557
 export WORLD_SIZE=4
 export GPU_IDS=0,1,2,3
@@ -184,6 +195,34 @@ export ASSISTANT_WINDOW_SIZE=4096
 export LIMIT_ROWS=2000
 
 bash seman_memcot/scripts/run_convert_4gpu.sh
+```
+
+Fixed-token conversion example:
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k_fixed
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export SEGMENTATION_MODE=fixed
+export FIXED_SEGMENT_TOKENS=128
+export GPU_IDS=0,1,2,3
+
+bash seman_memcot/scripts/run_convert_4gpu.sh
+```
+
+Random-token conversion example:
+
+```bash
+export INPUT=/data/bs17k.jsonl
+export RUN_DIR=runs/bs17k_random
+export MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+export SEGMENTATION_MODE=random
+export RANDOM_MIN_SEGMENT_TOKENS=64
+export RANDOM_MAX_SEGMENT_TOKENS=256
+export RANDOM_SEED=42
+export GPU_IDS=0,1,2,3
+
+bash seman_memcot/scripts/run_full_pipeline.sh
 ```
 
 Each worker writes:
@@ -244,9 +283,14 @@ These environment variables are the main knobs exposed by the shell wrappers:
 - `MODEL`: model name or local checkpoint path passed to the Python tools.
 - `REFERENCE_TRAIN_JSONL`: reference LightThinker train JSONL used by conversion; all fields except `thoughts_list` are inherited from this file.
 - `BACKEND`: scoring backend passed end-to-end to tau estimation and shard conversion. Common values are `hf` and `sglang`.
+- `SEGMENTATION_MODE`: `threshold`, `fixed`, or `random`; default `threshold`.
+- `FIXED_SEGMENT_TOKENS`: assistant-token interval for fixed mode; default `128`.
+- `RANDOM_MIN_SEGMENT_TOKENS`: minimum random segment length; default `64`.
+- `RANDOM_MAX_SEGMENT_TOKENS`: maximum random segment length; default `256`.
+- `RANDOM_SEED`: base seed for deterministic per-row random mode; default `42`.
 - `GPU_ID`: fallback single GPU used for tau estimation when `GPU_IDS` is unset.
 - `GPU_IDS`: comma-separated GPU list aligned with rank order. Tau estimation now runs one worker per visible GPU in this list.
-- `TAU_VALUE`: selected tau threshold used during shard conversion.
+- `TAU_VALUE`: selected tau threshold used during threshold shard conversion.
 - `WORLD_SIZE`: number of shard workers to launch.
 - `DTYPE`: torch dtype string, default `bfloat16`.
 - `TRUST_REMOTE_CODE`: set `0` to disable remote-code trust.
@@ -264,7 +308,7 @@ These environment variables are the main knobs exposed by the shell wrappers:
 
 Each conversion rank persists a JSON progress file at `${RUN_DIR}/progress/shard_<rank>.json`. The converter reads `last_source_idx`, `num_written`, `num_skipped`, `num_overlong`, and `finished` from that file before processing more rows. The same wrapper env vars, including `LIMIT_ROWS`, `ASSISTANT_WINDOW_SIZE`, and `LONG_SAMPLE_POLICY`, are passed through on resume runs.
 
-`run_convert_4gpu.sh` also writes `${RUN_DIR}/convert_runtime.env` as a small resume guard. If you rerun with the same `RUN_DIR` but change `TAU_VALUE`, `BACKEND`, `WORLD_SIZE`, `GPU_IDS`, `DTYPE`, `TRUST_REMOTE_CODE`, `BATCH_SIZE`, `ASSISTANT_WINDOW_SIZE`, `LIMIT_ROWS`, `LONG_SAMPLE_POLICY`, or other key conversion knobs, the wrapper stops early instead of mixing incompatible shard outputs into one merged dataset.
+`run_convert_4gpu.sh` also writes `${RUN_DIR}/convert_runtime.env` as a small resume guard. If you rerun with the same `RUN_DIR` but change `SEGMENTATION_MODE`, `TAU_VALUE`, `FIXED_SEGMENT_TOKENS`, random-mode bounds/seed, `BACKEND`, `WORLD_SIZE`, `GPU_IDS`, `DTYPE`, `TRUST_REMOTE_CODE`, `BATCH_SIZE`, `ASSISTANT_WINDOW_SIZE`, `LIMIT_ROWS`, `LONG_SAMPLE_POLICY`, or other key conversion knobs, the wrapper stops early instead of mixing incompatible shard outputs into one merged dataset.
 
 Operationally, that means:
 

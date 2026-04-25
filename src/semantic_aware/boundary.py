@@ -1,5 +1,6 @@
 """AdaptiveStep boundary selection helpers."""
 
+import random
 import re
 
 
@@ -88,10 +89,7 @@ def _relocate_boundary_index(
     offsets,
     shift_window,
 ):
-    """Find a nearby valid boundary when the current candidate falls inside a word."""
-    if text is None or offsets is None:
-        return None
-
+    """Find a nearby valid boundary when the current candidate is unsafe."""
     search_limit = max(0, int(shift_window))
 
     def is_usable(index):
@@ -102,8 +100,11 @@ def _relocate_boundary_index(
         step_size = index + 1 if last_boundary < 0 else index - last_boundary
         if step_size < min_step_tokens:
             return False
-        _, end_char = offsets[index]
-        return not _is_inside_word(text, end_char)
+        if text is not None and offsets is not None:
+            _, end_char = offsets[index]
+            if _is_inside_word(text, end_char):
+                return False
+        return True
 
     if is_usable(candidate_index):
         return candidate_index
@@ -197,6 +198,129 @@ def pick_boundaries(
         if chosen is not None:
             boundaries.append(chosen)
             last_boundary = chosen
+    return boundaries
+
+
+def _validate_regular_boundary_inputs(*, token_count, cuttable_mask, min_step_tokens):
+    if token_count < 0:
+        raise ValueError("token_count must be non-negative.")
+    if len(cuttable_mask) != token_count:
+        raise ValueError("cuttable_mask length must match token_count.")
+    if min_step_tokens <= 0:
+        raise ValueError("min_step_tokens must be positive.")
+
+
+def _append_regular_boundary(
+    *,
+    boundaries,
+    target_index,
+    cuttable_mask,
+    min_step_tokens,
+    text,
+    offsets,
+    word_relocation_window,
+):
+    last_boundary = boundaries[-1] if boundaries else -1
+    chosen = _relocate_boundary_index(
+        candidate_index=target_index,
+        cuttable_mask=cuttable_mask,
+        min_step_tokens=min_step_tokens,
+        last_boundary=last_boundary,
+        text=text,
+        offsets=offsets,
+        shift_window=word_relocation_window,
+    )
+    if chosen is not None and (not boundaries or chosen > boundaries[-1]):
+        boundaries.append(chosen)
+
+
+def pick_fixed_token_boundaries(
+    *,
+    token_count,
+    cuttable_mask,
+    segment_tokens,
+    min_step_tokens,
+    text=None,
+    offsets=None,
+    word_relocation_window=3,
+):
+    """Pick boundaries at fixed assistant-token intervals."""
+    _validate_regular_boundary_inputs(
+        token_count=token_count,
+        cuttable_mask=cuttable_mask,
+        min_step_tokens=min_step_tokens,
+    )
+    if segment_tokens <= 0:
+        raise ValueError("segment_tokens must be positive.")
+
+    boundaries = []
+    target_index = segment_tokens - 1
+    while target_index < token_count - 1:
+        _append_regular_boundary(
+            boundaries=boundaries,
+            target_index=target_index,
+            cuttable_mask=cuttable_mask,
+            min_step_tokens=min_step_tokens,
+            text=text,
+            offsets=offsets,
+            word_relocation_window=word_relocation_window,
+        )
+        target_index += segment_tokens
+    return boundaries
+
+
+def pick_random_token_boundaries(
+    *,
+    token_count,
+    cuttable_mask,
+    min_segment_tokens,
+    max_segment_tokens,
+    min_step_tokens,
+    source_idx,
+    random_seed=None,
+    seed=None,
+    text=None,
+    offsets=None,
+    word_relocation_window=3,
+):
+    """Pick deterministic pseudo-random assistant-token boundaries for one row."""
+    _validate_regular_boundary_inputs(
+        token_count=token_count,
+        cuttable_mask=cuttable_mask,
+        min_step_tokens=min_step_tokens,
+    )
+    if min_segment_tokens <= 0:
+        raise ValueError("random_min_segment_tokens must be positive.")
+    if max_segment_tokens <= 0:
+        raise ValueError("random_max_segment_tokens must be positive.")
+    if min_segment_tokens > max_segment_tokens:
+        raise ValueError("random_min_segment_tokens must be <= random_max_segment_tokens.")
+    if random_seed is None:
+        random_seed = seed
+    if random_seed is None:
+        raise ValueError("random_seed must be provided.")
+
+    rng = random.Random(int(random_seed) + int(source_idx))
+    boundaries = []
+    last_boundary = -1
+    while True:
+        segment_size = rng.randint(min_segment_tokens, max_segment_tokens)
+        target_index = last_boundary + segment_size
+        if target_index >= token_count - 1:
+            break
+        _append_regular_boundary(
+            boundaries=boundaries,
+            target_index=target_index,
+            cuttable_mask=cuttable_mask,
+            min_step_tokens=min_step_tokens,
+            text=text,
+            offsets=offsets,
+            word_relocation_window=word_relocation_window,
+        )
+        if boundaries:
+            last_boundary = boundaries[-1]
+        else:
+            last_boundary = target_index
     return boundaries
 
 

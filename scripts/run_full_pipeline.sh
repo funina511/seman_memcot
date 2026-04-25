@@ -8,8 +8,13 @@ RUN_DIR="${RUN_DIR:-runs/bs17k-seman}"
 MODEL="${MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKEND="${BACKEND:-hf}"
 REFERENCE_TRAIN_JSONL="${REFERENCE_TRAIN_JSONL:-${ROOT_DIR}/../RRcot/data/train/train.jsonl}"
+SEGMENTATION_MODE="${SEGMENTATION_MODE:-threshold}"
 TAU_KEY="${TAU_KEY:-q_0.0100}"
 TAU_VALUE="${TAU_VALUE:-}"
+FIXED_SEGMENT_TOKENS="${FIXED_SEGMENT_TOKENS:-128}"
+RANDOM_MIN_SEGMENT_TOKENS="${RANDOM_MIN_SEGMENT_TOKENS:-64}"
+RANDOM_MAX_SEGMENT_TOKENS="${RANDOM_MAX_SEGMENT_TOKENS:-256}"
+RANDOM_SEED="${RANDOM_SEED:-42}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 ASSISTANT_WINDOW_SIZE="${ASSISTANT_WINDOW_SIZE:-4096}"
@@ -40,12 +45,20 @@ print(data[tau_key])
 PY
 }
 
+if [[ "${SEGMENTATION_MODE}" != "threshold" && "${SEGMENTATION_MODE}" != "fixed" && "${SEGMENTATION_MODE}" != "random" ]]; then
+  echo "ERROR: SEGMENTATION_MODE must be one of: threshold, fixed, random." >&2
+  exit 1
+fi
+
 # Full pipeline wrapper: keep the major runtime knobs visible at this top level.
-export INPUT RUN_DIR MODEL BACKEND REFERENCE_TRAIN_JSONL TAU_KEY TAU_VALUE WORLD_SIZE GPU_IDS ASSISTANT_WINDOW_SIZE ASSISTANT_STRIDE LIMIT_ROWS LONG_SAMPLE_POLICY SGLANG_MEM_FRACTION_STATIC SGLANG_CHUNKED_PREFILL_SIZE SGLANG_CUDA_GRAPH_MAX_BS
-bash "${SCRIPT_DIR}/run_estimate_tau.sh"
-if [[ -z "${TAU_VALUE:-}" ]]; then
-  # Default to the 1% candidate unless the operator pins TAU_VALUE explicitly.
-  export TAU_VALUE
-  TAU_VALUE="$(resolve_tau_value)"
+export INPUT RUN_DIR MODEL BACKEND REFERENCE_TRAIN_JSONL SEGMENTATION_MODE TAU_KEY TAU_VALUE FIXED_SEGMENT_TOKENS RANDOM_MIN_SEGMENT_TOKENS RANDOM_MAX_SEGMENT_TOKENS RANDOM_SEED WORLD_SIZE GPU_IDS ASSISTANT_WINDOW_SIZE ASSISTANT_STRIDE LIMIT_ROWS LONG_SAMPLE_POLICY SGLANG_MEM_FRACTION_STATIC SGLANG_CHUNKED_PREFILL_SIZE SGLANG_CUDA_GRAPH_MAX_BS
+if [[ "${SEGMENTATION_MODE}" == "threshold" ]]; then
+  # run tau estimation only for threshold segmentation; fixed/random go straight to conversion.
+  bash "${SCRIPT_DIR}/run_estimate_tau.sh"
+  if [[ -z "${TAU_VALUE:-}" ]]; then
+    # Default to the 1% candidate unless the operator pins TAU_VALUE explicitly.
+    export TAU_VALUE
+    TAU_VALUE="$(resolve_tau_value)"
+  fi
 fi
 bash "${SCRIPT_DIR}/run_convert_4gpu.sh"

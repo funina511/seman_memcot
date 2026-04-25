@@ -43,14 +43,24 @@ def parse_dtype(dtype_name):
     return mapping[dtype_name]
 
 
-def load_model_and_tokenizer(model_name, dtype="bfloat16", trust_remote_code=True):
-    """Load a Hugging Face causal LM and tokenizer."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def load_tokenizer(model_name, trust_remote_code=True):
+    """Load only the Hugging Face tokenizer."""
+    from transformers import AutoTokenizer
 
-    torch_dtype = parse_dtype(dtype)
-    tokenizer = AutoTokenizer.from_pretrained(
+    return AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=bool(trust_remote_code),
+    )
+
+
+def load_model_and_tokenizer(model_name, dtype="bfloat16", trust_remote_code=True):
+    """Load a Hugging Face causal LM and tokenizer."""
+    from transformers import AutoModelForCausalLM
+
+    torch_dtype = parse_dtype(dtype)
+    tokenizer = load_tokenizer(
+        model_name,
+        trust_remote_code=trust_remote_code,
     )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,

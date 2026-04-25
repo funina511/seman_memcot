@@ -13,7 +13,12 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from semantic_aware.boundary import pick_boundaries, split_text_by_token_boundaries
+from semantic_aware.boundary import (
+    pick_boundaries,
+    pick_fixed_token_boundaries,
+    pick_random_token_boundaries,
+    split_text_by_token_boundaries,
+)
 from semantic_aware.exporter import build_output_record_from_reference
 from semantic_aware.io_utils import (
     append_jsonl,
@@ -23,7 +28,7 @@ from semantic_aware.io_utils import (
     write_runtime_metadata,
 )
 from semantic_aware.protected_tokens import build_cuttable_mask, find_protected_spans
-from semantic_aware.scoring import count_scoring_windows, tokenize_prompt_and_assistant
+from semantic_aware.scoring import count_scoring_windows, load_tokenizer, tokenize_prompt_and_assistant
 from semantic_aware.scoring_backends import init_scoring_backend
 
 
@@ -81,7 +86,11 @@ def _validate_resume_consistency(*, progress, progress_exists, output_rows, outp
             f"progress={progress_path}."
         )
     rows_scored = progress.get("rows_scored")
-    if rows_scored is not None and rows_scored < expected_written:
+    if (
+        getattr(args, "segmentation_mode", "threshold") == "threshold"
+        and rows_scored is not None
+        and rows_scored < expected_written
+    ):
         raise RuntimeError(
             f"Progress rows_scored={rows_scored} is smaller than num_written={expected_written}. "
             f"progress={progress_path}."
@@ -97,7 +106,37 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Input JSONL path")
     parser.add_argument("--model", required=True, help="Model name or local path")
-    parser.add_argument("--tau", required=True, type=float, help="Chosen tau value")
+    parser.add_argument("--tau", default=None, type=float, help="Chosen tau value for threshold segmentation")
+    parser.add_argument(
+        "--segmentation_mode",
+        default="threshold",
+        choices=["threshold", "fixed", "random"],
+        help="Segmentation mode: threshold scores model confidences; fixed/random use tokenizer-only token counts",
+    )
+    parser.add_argument(
+        "--fixed_segment_tokens",
+        default=128,
+        type=int,
+        help="Assistant-token interval for fixed segmentation",
+    )
+    parser.add_argument(
+        "--random_min_segment_tokens",
+        default=64,
+        type=int,
+        help="Minimum assistant-token segment size for random segmentation",
+    )
+    parser.add_argument(
+        "--random_max_segment_tokens",
+        default=256,
+        type=int,
+        help="Maximum assistant-token segment size for random segmentation",
+    )
+    parser.add_argument(
+        "--random_seed",
+        default=42,
+        type=int,
+        help="Base seed for deterministic per-row random segmentation",
+    )
     parser.add_argument(
         "--backend",
         default="hf",
@@ -143,7 +182,36 @@ def parse_args():
         choices=["window", "skip"],
         help="Whether already-scored over-max_length rows stay in output or are dropped after counting them",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    _apply_segmentation_defaults(args)
+    _validate_segmentation_args(args, parser.error)
+    return args
+
+
+def _apply_segmentation_defaults(args):
+    defaults = {
+        "segmentation_mode": "threshold",
+        "fixed_segment_tokens": 128,
+        "random_min_segment_tokens": 64,
+        "random_max_segment_tokens": 256,
+        "random_seed": 42,
+    }
+    for name, value in defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
+
+
+def _validate_segmentation_args(args, error):
+    if args.segmentation_mode == "threshold" and args.tau is None:
+        error("--tau is required when --segmentation_mode=threshold")
+    if args.fixed_segment_tokens <= 0:
+        error("--fixed_segment_tokens must be positive")
+    if args.random_min_segment_tokens <= 0:
+        error("--random_min_segment_tokens must be positive")
+    if args.random_max_segment_tokens <= 0:
+        error("--random_max_segment_tokens must be positive")
+    if args.random_min_segment_tokens > args.random_max_segment_tokens:
+        error("--random_min_segment_tokens must be <= --random_max_segment_tokens")
 
 
 def _cuda_peak_memory_mb():
@@ -158,6 +226,11 @@ def _cuda_peak_memory_mb():
 
 def main():
     args = parse_args()
+    _apply_segmentation_defaults(args)
+    _validate_segmentation_args(
+        args,
+        lambda message: (_ for _ in ()).throw(ValueError(message)),
+    )
     output_path = Path(args.output)
     progress_path = Path(args.progress)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,12 +254,19 @@ def main():
         return
     last_source_idx = progress.get("last_source_idx", -1)
 
-    scoring_backend, tokenizer = init_scoring_backend(
-        backend_name=args.backend,
-        model_name=args.model,
-        dtype=args.dtype,
-        trust_remote_code=bool(args.trust_remote_code),
-    )
+    if args.segmentation_mode == "threshold":
+        scoring_backend, tokenizer = init_scoring_backend(
+            backend_name=args.backend,
+            model_name=args.model,
+            dtype=args.dtype,
+            trust_remote_code=bool(args.trust_remote_code),
+        )
+    else:
+        scoring_backend = None
+        tokenizer = load_tokenizer(
+            args.model,
+            trust_remote_code=bool(args.trust_remote_code),
+        )
     reference_iter = iter_jsonl(args.reference_train_jsonl, limit_rows=args.limit_rows)
 
     written = progress.get("num_written", 0)
@@ -259,39 +339,55 @@ def main():
             persist_progress(finished=False)
             continue
 
+        if args.segmentation_mode in {"fixed", "random"}:
+            _, token_ids, offsets = tokenize_prompt_and_assistant(
+                tokenizer,
+                system_prompt=system_prompt,
+                question=question,
+                assistant_text=assistant,
+            )
+            confidences = []
+        else:
+            token_ids = offsets = confidences = None
+
         if args.long_sample_policy == "skip":
             # Skip overlong rows before model scoring to avoid avoidable OOM spikes.
-            try:
-                _, preview_assistant_ids, _ = tokenize_prompt_and_assistant(
-                    tokenizer,
-                    system_prompt=system_prompt,
-                    question=question,
-                    assistant_text=assistant,
-                )
-            except Exception:
-                preview_assistant_ids = None
+            if token_ids is None:
+                try:
+                    _, preview_assistant_ids, _ = tokenize_prompt_and_assistant(
+                        tokenizer,
+                        system_prompt=system_prompt,
+                        question=question,
+                        assistant_text=assistant,
+                    )
+                except Exception:
+                    preview_assistant_ids = None
+            else:
+                preview_assistant_ids = token_ids
             if preview_assistant_ids is not None and len(preview_assistant_ids) > args.max_length:
                 overlong += 1
                 persist_progress(finished=False)
                 continue
 
-        started = time.perf_counter()
-        token_ids, offsets, confidences = scoring_backend.score_assistant_tokens(
-            system_prompt=system_prompt,
-            question=question,
-            assistant_text=assistant,
-            assistant_window_size=args.assistant_window_size,
-            assistant_stride=args.assistant_stride,
-        )
-        score_seconds_total += time.perf_counter() - started
-        rows_scored += 1
+        if args.segmentation_mode == "threshold":
+            started = time.perf_counter()
+            token_ids, offsets, confidences = scoring_backend.score_assistant_tokens(
+                system_prompt=system_prompt,
+                question=question,
+                assistant_text=assistant,
+                assistant_window_size=args.assistant_window_size,
+                assistant_stride=args.assistant_stride,
+            )
+            score_seconds_total += time.perf_counter() - started
+            rows_scored += 1
         token_count += len(token_ids)
-        window_count += count_scoring_windows(
-            prefix_ids=[],
-            assistant_ids=token_ids,
-            assistant_window_size=args.assistant_window_size,
-            assistant_stride=args.assistant_stride,
-        )
+        if args.segmentation_mode == "threshold":
+            window_count += count_scoring_windows(
+                prefix_ids=[],
+                assistant_ids=token_ids,
+                assistant_window_size=args.assistant_window_size,
+                assistant_stride=args.assistant_stride,
+            )
         scored_token_count += len(confidences)
         if len(token_ids) > args.max_length:
             overlong += 1
@@ -306,14 +402,36 @@ def main():
             special_ids=getattr(tokenizer, "all_special_ids", []),
             protected_spans=protected_spans,
         )
-        boundaries = pick_boundaries(
-            confidences=confidences,
-            cuttable_mask=cuttable_mask,
-            tau=args.tau,
-            min_step_tokens=args.min_step_tokens,
-            text=assistant,
-            offsets=offsets,
-        )
+        if args.segmentation_mode == "threshold":
+            boundaries = pick_boundaries(
+                confidences=confidences,
+                cuttable_mask=cuttable_mask,
+                tau=args.tau,
+                min_step_tokens=args.min_step_tokens,
+                text=assistant,
+                offsets=offsets,
+            )
+        elif args.segmentation_mode == "fixed":
+            boundaries = pick_fixed_token_boundaries(
+                token_count=len(token_ids),
+                cuttable_mask=cuttable_mask,
+                segment_tokens=args.fixed_segment_tokens,
+                min_step_tokens=args.min_step_tokens,
+                text=assistant,
+                offsets=offsets,
+            )
+        else:
+            boundaries = pick_random_token_boundaries(
+                token_count=len(token_ids),
+                cuttable_mask=cuttable_mask,
+                min_segment_tokens=args.random_min_segment_tokens,
+                max_segment_tokens=args.random_max_segment_tokens,
+                min_step_tokens=args.min_step_tokens,
+                source_idx=source_idx,
+                random_seed=args.random_seed,
+                text=assistant,
+                offsets=offsets,
+            )
         thoughts_list = split_text_by_token_boundaries(
             text=assistant,
             offsets=offsets,
@@ -360,6 +478,11 @@ def main():
             "assistant_window_size": args.assistant_window_size,
             "assistant_stride": args.assistant_stride,
             "long_sample_policy": args.long_sample_policy,
+            "segmentation_mode": args.segmentation_mode,
+            "fixed_segment_tokens": args.fixed_segment_tokens,
+            "random_min_segment_tokens": args.random_min_segment_tokens,
+            "random_max_segment_tokens": args.random_max_segment_tokens,
+            "random_seed": args.random_seed,
         },
     )
 
