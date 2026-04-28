@@ -7,7 +7,7 @@
 - `4` 卡分 shard 转换
 - 断点续跑
 - 自动读取估计出的 `tau`
-- `threshold` / `fixed` / `random` 三种切分模式
+- `threshold` / `fixed` / `random` 三种切分模式.
 
 如果你想看英文版总说明，可以参考 [README.md](README.md)。
 
