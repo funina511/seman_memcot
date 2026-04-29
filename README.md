@@ -178,7 +178,22 @@ The conversion wrapper launches one `convert_shard.py` worker per rank, writes p
 
 `fixed` and `random` still need `MODEL` so the converter can load the model tokenizer and recover assistant token offsets, but they do not load the full scoring backend/model and do not need `TAU_VALUE`. In `run_full_pipeline.sh`, these modes skip tau estimation and go straight to conversion.
 
+For fixed/random modes, the configured segment size is measured from the last accepted boundary, and the configured size itself must be at least `MIN_STEP_TOKENS`. If a target token is unsafe because of protected tokens or word-internal cuts, the segment extends forward until a safe boundary is found.
+
 `TAU_VALUE` is required for `run_convert_4gpu.sh` only when `SEGMENTATION_MODE=threshold`. This keeps the two-step threshold workflow from silently falling back to a stale default tau.
+
+For less environment-variable setup, use the CLI wrapper:
+
+```bash
+bash seman_memcot/scripts/run_pipeline_cli.sh \
+  --input /data/bs17k.jsonl \
+  --mode fixed \
+  --size base \
+  --gpu-ids 0,1,2,3
+```
+
+`--size short|base|long` maps to fixed intervals of `64|128|256` tokens and random ranges of `64-128|64-256|128-512`.
+The wrapper also accepts `--min-step-tokens` and rejects invalid fixed/random combinations before entering the pipeline.
 
 Typical 4-GPU run:
 

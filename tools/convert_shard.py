@@ -212,6 +212,10 @@ def _validate_segmentation_args(args, error):
         error("--random_max_segment_tokens must be positive")
     if args.random_min_segment_tokens > args.random_max_segment_tokens:
         error("--random_min_segment_tokens must be <= --random_max_segment_tokens")
+    if args.segmentation_mode == "fixed" and args.fixed_segment_tokens < args.min_step_tokens:
+        error("--fixed_segment_tokens must be >= --min_step_tokens")
+    if args.segmentation_mode == "random" and args.random_min_segment_tokens < args.min_step_tokens:
+        error("--random_min_segment_tokens must be >= --min_step_tokens")
 
 
 def _cuda_peak_memory_mb():

@@ -72,7 +72,7 @@ bash seman_memcot/scripts/run_full_pipeline.sh
 - 启动 shard 转换
 - 合并成最终 `train.jsonl`
 
-如果设置 `SEGMENTATION_MODE=fixed` 或 `SEGMENTATION_MODE=random`，`run_full_pipeline.sh` 会跳过 tau 估计，直接进入转换。这两种模式仍然需要 `MODEL` 来加载 tokenizer、计算 assistant token offset，但不会加载完整打分后端/模型，也不需要 `TAU_VALUE`。
+如果设置 `SEGMENTATION_MODE=fixed` 或 `SEGMENTATION_MODE=random`，`run_full_pipeline.sh` 会跳过 tau 估计，直接进入转换。这两种模式仍然需要 `MODEL` 来加载 tokenizer、计算 assistant token offset，但不会加载完整打分后端/模型，也不需要 `TAU_VALUE`。fixed/random 模式会从“实际接受的上一刀”开始计算段长；配置的段长本身需要不小于 `MIN_STEP_TOKENS`。如果目标 token 因保护片段或词内部切点不可切，当前段会继续向后延长，直到找到安全边界。
 
 如果你想做最快、最稳的 correctness smoke test，推荐先用本地 Hugging Face 后端，并把样本量压小：
 
@@ -123,6 +123,25 @@ bash seman_memcot/scripts/run_convert_4gpu.sh
 
 注意：只有 `SEGMENTATION_MODE=threshold` 时，`run_convert_4gpu.sh` 才要求你显式设置 `TAU_VALUE`，不会再偷偷回退到旧默认值。
 另外，`run_estimate_tau.sh` 现在会按 `GPU_IDS` 里的可见卡列表，每张 GPU 启动一个 worker 来并行估计 tau；单卡时不设 `GPU_IDS` 或保留 `GPU_ID=0` 即可。
+
+如果不想反复 `export` 参数，可以优先使用命令行包装脚本：
+
+```bash
+bash seman_memcot/scripts/run_pipeline_cli.sh \
+  --input /data/bs17k.jsonl \
+  --mode fixed \
+  --size base \
+  --gpu-ids 0,1,2,3
+```
+
+`--size` 是给 fixed/random 的便捷预设：
+
+- `short`：fixed=64；random=64-128
+- `base`：fixed=128；random=64-256，推荐先用这个
+- `long`：fixed=256；random=128-512
+
+如果你已经明确想要某个固定 token 数，可以用 `--fixed-tokens 192` 覆盖预设。random 模式可以用 `--random-min` / `--random-max` 覆盖。
+包装脚本也支持 `--min-step-tokens`，并会在进入 pipeline 之前拦住 `--fixed-tokens < MIN_STEP_TOKENS`、`--random-min < MIN_STEP_TOKENS` 或 `--random-min > --random-max` 这类无效组合。
 
 固定 token 数切分示例：
 

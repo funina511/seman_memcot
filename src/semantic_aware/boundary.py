@@ -88,12 +88,18 @@ def _relocate_boundary_index(
     text,
     offsets,
     shift_window,
+    min_index=None,
+    max_index=None,
 ):
     """Find a nearby valid boundary when the current candidate is unsafe."""
     search_limit = max(0, int(shift_window))
 
     def is_usable(index):
         if index < 0 or index >= len(cuttable_mask):
+            return False
+        if min_index is not None and index < min_index:
+            return False
+        if max_index is not None and index > max_index:
             return False
         if not cuttable_mask[index]:
             return False
@@ -210,17 +216,16 @@ def _validate_regular_boundary_inputs(*, token_count, cuttable_mask, min_step_to
         raise ValueError("min_step_tokens must be positive.")
 
 
-def _append_regular_boundary(
+def _resolve_regular_boundary(
     *,
-    boundaries,
     target_index,
     cuttable_mask,
     min_step_tokens,
+    last_boundary,
     text,
     offsets,
     word_relocation_window,
 ):
-    last_boundary = boundaries[-1] if boundaries else -1
     chosen = _relocate_boundary_index(
         candidate_index=target_index,
         cuttable_mask=cuttable_mask,
@@ -229,9 +234,12 @@ def _append_regular_boundary(
         text=text,
         offsets=offsets,
         shift_window=word_relocation_window,
+        min_index=target_index,
+        max_index=len(cuttable_mask) - 2,
     )
-    if chosen is not None and (not boundaries or chosen > boundaries[-1]):
-        boundaries.append(chosen)
+    if chosen is None or chosen <= last_boundary:
+        return None
+    return chosen
 
 
 def pick_fixed_token_boundaries(
@@ -254,18 +262,24 @@ def pick_fixed_token_boundaries(
         raise ValueError("segment_tokens must be positive.")
 
     boundaries = []
+    last_boundary = -1
     target_index = segment_tokens - 1
     while target_index < token_count - 1:
-        _append_regular_boundary(
-            boundaries=boundaries,
+        chosen = _resolve_regular_boundary(
             target_index=target_index,
             cuttable_mask=cuttable_mask,
             min_step_tokens=min_step_tokens,
+            last_boundary=last_boundary,
             text=text,
             offsets=offsets,
             word_relocation_window=word_relocation_window,
         )
-        target_index += segment_tokens
+        if chosen is None:
+            target_index += 1
+            continue
+        boundaries.append(chosen)
+        last_boundary = chosen
+        target_index = last_boundary + segment_tokens
     return boundaries
 
 
@@ -308,19 +322,24 @@ def pick_random_token_boundaries(
         target_index = last_boundary + segment_size
         if target_index >= token_count - 1:
             break
-        _append_regular_boundary(
-            boundaries=boundaries,
-            target_index=target_index,
-            cuttable_mask=cuttable_mask,
-            min_step_tokens=min_step_tokens,
-            text=text,
-            offsets=offsets,
-            word_relocation_window=word_relocation_window,
-        )
-        if boundaries:
-            last_boundary = boundaries[-1]
+
+        while target_index < token_count - 1:
+            chosen = _resolve_regular_boundary(
+                target_index=target_index,
+                cuttable_mask=cuttable_mask,
+                min_step_tokens=min_step_tokens,
+                last_boundary=last_boundary,
+                text=text,
+                offsets=offsets,
+                word_relocation_window=word_relocation_window,
+            )
+            if chosen is not None:
+                boundaries.append(chosen)
+                last_boundary = chosen
+                break
+            target_index += 1
         else:
-            last_boundary = target_index
+            break
     return boundaries
 
 
